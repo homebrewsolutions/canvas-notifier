@@ -271,7 +271,7 @@ DASHBOARD_HTML = """
   <script>
     let cachedAssignments = [];
 
-    function dismissKey(a) { return `${a.course}::${a.title}::${a.due}`; }
+    function dismissKey(a) { return `${a.title}::${a.course} · ${a.points} pts`; }
     function getDismissed() { return new Set(JSON.parse(localStorage.getItem('dismissed') || '[]')); }
     function saveDismissed(set) { localStorage.setItem('dismissed', JSON.stringify([...set])); }
 
@@ -281,15 +281,14 @@ DASHBOARD_HTML = """
         aDiv.innerHTML = '<p style="color:#555">No assignments due in the next 14 days 🎉</p>';
         return;
       }
-      aDiv.innerHTML = assignments.map(a => {
+      aDiv.innerHTML = assignments.map((a, i) => {
         let urgencyClass = 'upcoming', tag = '', tagClass = '';
         if (a.days_left <= 1)      { urgencyClass='urgent';   tag='TODAY/TOMORROW'; tagClass='red'; }
         else if (a.days_left <= 3) { urgencyClass='soon';     tag=`${a.days_left}d left`; tagClass='orange'; }
         else                       { urgencyClass='upcoming'; tag=`${a.days_left}d left`; tagClass='green'; }
-        const key = dismissKey(a);
         return `
-          <div class="assignment ${urgencyClass}" id="assign-${btoa(key).replace(/=/g,'')}">
-            <button class="dismiss-btn" onclick="dismiss('${btoa(key).replace(/=/g,'')}')" title="Mark as done">&#x2715;</button>
+          <div class="assignment ${urgencyClass}" id="assign-${i}">
+            <button class="dismiss-btn" onclick="dismiss(${i})" title="Mark as done">&times;</button>
             <div class="title">${a.title}</div>
             <div class="meta">${a.course} · ${a.points} pts</div>
             <div class="due">
@@ -300,14 +299,16 @@ DASHBOARD_HTML = """
       }).join('');
     }
 
-    function dismiss(encodedKey) {
-      const key = atob(encodedKey);
+    function dismiss(i) {
+      const el = document.getElementById(`assign-${i}`);
+      if (!el) return;
+      const title = el.querySelector('.title').textContent;
+      const meta  = el.querySelector('.meta').textContent;
+      const key   = title + '::' + meta;
       const dismissed = getDismissed();
       dismissed.add(key);
       saveDismissed(dismissed);
-      const el = document.getElementById(`assign-${encodedKey}`);
-      if (el) el.remove();
-      // Update badge
+      el.remove();
       const remaining = document.querySelectorAll('.assignment').length;
       document.getElementById('count-badge').textContent =
         `${remaining} assignment${remaining !== 1 ? 's' : ''}`;

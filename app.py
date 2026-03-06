@@ -119,6 +119,18 @@ DASHBOARD_HTML = """
     .assignment .title   { font-weight: 600; font-size: 0.95rem; }
     .assignment .meta    { font-size: 0.82rem; color: #888; margin-top: 4px; }
     .assignment .due     { font-size: 0.82rem; margin-top: 6px; }
+    .dismiss-btn {
+      float: right;
+      background: none;
+      border: none;
+      color: #444;
+      font-size: 1rem;
+      cursor: pointer;
+      line-height: 1;
+      padding: 0;
+      margin-left: 8px;
+    }
+    .dismiss-btn:hover { color: #ff6b6b; }
     .tag {
       display: inline-block;
       padding: 2px 8px;
@@ -259,6 +271,52 @@ DASHBOARD_HTML = """
   <script>
     let cachedAssignments = [];
 
+    function dismissKey(a) { return `${a.course}::${a.title}::${a.due}`; }
+    function getDismissed() { return new Set(JSON.parse(localStorage.getItem('dismissed') || '[]')); }
+    function saveDismissed(set) { localStorage.setItem('dismissed', JSON.stringify([...set])); }
+
+    function renderAssignments(assignments) {
+      const aDiv = document.getElementById('assignments');
+      if (assignments.length === 0) {
+        aDiv.innerHTML = '<p style="color:#555">No assignments due in the next 14 days 🎉</p>';
+        return;
+      }
+      aDiv.innerHTML = assignments.map(a => {
+        let urgencyClass = 'upcoming', tag = '', tagClass = '';
+        if (a.days_left <= 1)      { urgencyClass='urgent';   tag='TODAY/TOMORROW'; tagClass='red'; }
+        else if (a.days_left <= 3) { urgencyClass='soon';     tag=`${a.days_left}d left`; tagClass='orange'; }
+        else                       { urgencyClass='upcoming'; tag=`${a.days_left}d left`; tagClass='green'; }
+        const key = dismissKey(a);
+        return `
+          <div class="assignment ${urgencyClass}" id="assign-${btoa(key).replace(/=/g,'')}">
+            <button class="dismiss-btn" onclick="dismiss('${btoa(key).replace(/=/g,'')}')" title="Mark as done">&#x2715;</button>
+            <div class="title">${a.title}</div>
+            <div class="meta">${a.course} · ${a.points} pts</div>
+            <div class="due">
+              <span class="tag ${tagClass}">${tag}</span>
+              📅 ${a.due_str}
+            </div>
+          </div>`;
+      }).join('');
+    }
+
+    function dismiss(encodedKey) {
+      const key = atob(encodedKey);
+      const dismissed = getDismissed();
+      dismissed.add(key);
+      saveDismissed(dismissed);
+      const el = document.getElementById(`assign-${encodedKey}`);
+      if (el) el.remove();
+      // Update badge
+      const remaining = document.querySelectorAll('.assignment').length;
+      document.getElementById('count-badge').textContent =
+        `${remaining} assignment${remaining !== 1 ? 's' : ''}`;
+      if (remaining === 0) {
+        document.getElementById('assignments').innerHTML =
+          '<p style="color:#555">No assignments due in the next 14 days 🎉</p>';
+      }
+    }
+
     async function loadAll() {
       document.getElementById('ai-summary').textContent = 'Loading...';
       document.getElementById('assignments').innerHTML = '<p class="loading">Fetching from Canvas...</p>';
@@ -276,35 +334,19 @@ DASHBOARD_HTML = """
 
       cachedAssignments = assignData.assignments || [];
 
+      // Filter out dismissed assignments
+      const dismissed = getDismissed();
+      const visible = cachedAssignments.filter(a => !dismissed.has(dismissKey(a)));
+
       // Badge
       document.getElementById('count-badge').textContent =
-        `${cachedAssignments.length} assignment${cachedAssignments.length !== 1 ? 's' : ''}`;
+        `${visible.length} assignment${visible.length !== 1 ? 's' : ''}`;
 
       // Summary
       document.getElementById('ai-summary').textContent = summaryData.summary;
 
       // Assignments
-      const aDiv = document.getElementById('assignments');
-      if (cachedAssignments.length === 0) {
-        aDiv.innerHTML = '<p style="color:#555">No assignments due in the next 14 days 🎉</p>';
-      } else {
-        aDiv.innerHTML = cachedAssignments.map(a => {
-          let urgencyClass = 'upcoming', tag = '', tagClass = '';
-          if (a.days_left <= 1)      { urgencyClass='urgent';   tag='TODAY/TOMORROW'; tagClass='red'; }
-          else if (a.days_left <= 3) { urgencyClass='soon';     tag=`${a.days_left}d left`; tagClass='orange'; }
-          else                       { urgencyClass='upcoming'; tag=`${a.days_left}d left`; tagClass='green'; }
-
-          return `
-            <div class="assignment ${urgencyClass}">
-              <div class="title">${a.title}</div>
-              <div class="meta">${a.course} · ${a.points} pts</div>
-              <div class="due">
-                <span class="tag ${tagClass}">${tag}</span>
-                📅 ${a.due_str}
-              </div>
-            </div>`;
-        }).join('');
-      }
+      renderAssignments(visible);
 
       // Schedule
       const sDiv = document.getElementById('schedule');

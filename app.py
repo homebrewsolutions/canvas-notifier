@@ -530,7 +530,7 @@ SETUP_HTML = """
         <div class="steps">
           <p>How to get your calendar feed URL:</p>
           <ol>
-            <li>Go to <a href="https://howard.instructure.com" target="_blank">howard.instructure.com</a> and log in</li>
+            <li>Go to your university's Canvas and log in</li>
             <li>Click <strong>Calendar</strong> in the left sidebar</li>
             <li>At the bottom-right of the page, click <strong>Calendar Feed</strong></li>
             <li>Copy the full URL that appears</li>
@@ -574,7 +574,7 @@ def setup():
     feed_url = request.form.get("feed_url", "").strip()
     if not feed_url:
         return render_template_string(SETUP_HTML, success=False, error="Please paste your Canvas calendar feed URL.")
-    if "instructure.com/feeds/calendars" not in feed_url:
+    if "feeds/calendars" not in feed_url:
         return render_template_string(SETUP_HTML, success=False, error="That doesn't look like a Canvas calendar feed URL. Make sure you copied the full link.")
 
     # Validate by fetching the feed

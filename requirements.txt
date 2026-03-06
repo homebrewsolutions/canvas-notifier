@@ -1,0 +1,7 @@
+requests
+twilio
+anthropic
+flask
+python-dotenv
+gunicorn
+icalendar

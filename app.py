@@ -123,8 +123,8 @@ DASHBOARD_HTML = """
       float: right;
       background: none;
       border: none;
-      color: #444;
-      font-size: 1rem;
+      color: #fff;
+      font-size: 1.1rem;
       cursor: pointer;
       line-height: 1;
       padding: 0;

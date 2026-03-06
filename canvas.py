@@ -6,12 +6,14 @@ No API token required — uses the personal calendar feed URL from Canvas.
 import os
 import requests
 from datetime import datetime, timezone, timedelta, date
+from zoneinfo import ZoneInfo
 from icalendar import Calendar
 from dotenv import load_dotenv
 
 load_dotenv()
 
-DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", 14))
+DAYS_AHEAD  = int(os.getenv("DAYS_AHEAD", 14))
+DISPLAY_TZ  = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
 
 
 def get_upcoming_assignments(feed_url=None):
@@ -23,9 +25,10 @@ def get_upcoming_assignments(feed_url=None):
     resp = requests.get(feed_url, timeout=15)
     resp.raise_for_status()
 
-    cal  = Calendar.from_ical(resp.content)
-    now  = datetime.now(timezone.utc)
-    end  = now + timedelta(days=DAYS_AHEAD)
+    cal      = Calendar.from_ical(resp.content)
+    now      = datetime.now(timezone.utc)
+    now_local = now.astimezone(DISPLAY_TZ)
+    end      = now + timedelta(days=DAYS_AHEAD)
 
     assignments = []
 
@@ -51,15 +54,16 @@ def get_upcoming_assignments(feed_url=None):
 
         summary = str(component.get('SUMMARY', 'Unnamed Assignment'))
         course, title = _parse_course_and_title(summary, component)
-        url = str(component.get('URL', ''))
+        url        = str(component.get('URL', ''))
         description = str(component.get('DESCRIPTION', ''))
+        due_local  = due_dt.astimezone(DISPLAY_TZ)
 
         assignments.append({
             "course":      course,
             "title":       title,
             "due":         due_dt,
-            "due_str":     due_dt.strftime("%A, %b %-d @ %-I:%M %p"),
-            "days_left":   (due_dt.date() - now.date()).days,
+            "due_str":     due_local.strftime("%A, %b %-d @ %-I:%M %p"),
+            "days_left":   (due_local.date() - now_local.date()).days,
             "points":      "?",
             "description": description,
             "url":         url,

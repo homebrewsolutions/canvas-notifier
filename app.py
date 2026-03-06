@@ -50,7 +50,7 @@ DASHBOARD_HTML = """
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>📚 Howard Canvas Assistant</title>
+  <title>📚 Canvas Assistant</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -225,7 +225,7 @@ DASHBOARD_HTML = """
 <body>
   <header>
     <div>
-      <h1>📚 Howard Canvas Assistant</h1>
+      <h1>📚 Canvas Assistant</h1>
       <p>AI-powered assignment tracker · Next 14 days</p>
     </div>
     <span class="badge" id="count-badge">Loading...</span>
@@ -637,7 +637,7 @@ def setup():
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("🚀 Starting Howard Canvas Assistant...")
+    print("🚀 Starting Canvas Assistant...")
     print("   Dashboard: http://localhost:5000")
     print("   SMS webhook: http://localhost:5000/sms")
     print("   (use ngrok to expose the webhook to Twilio)\n")

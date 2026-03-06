@@ -24,7 +24,7 @@ from notifier import send_sms
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "changeme")
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or "howard-canvas-x9k2mzp-fallback-key"
 
 
 def get_feed_url():

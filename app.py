@@ -45,7 +45,7 @@ def get_phone():
 @app.before_request
 def require_auth():
     """Redirect to /setup or /setup/phone if not fully configured."""
-    exempt = ('/setup', '/sms')
+    exempt = ('/setup', '/sms', '/health')
     if any(request.path.startswith(e) for e in exempt):
         return
     if not get_access_token():
@@ -417,6 +417,11 @@ DASHBOARD_HTML = """
 # ─────────────────────────────────────────────
 #  ROUTES
 # ─────────────────────────────────────────────
+
+@app.route("/health")
+def health():
+    return "ok", 200
+
 
 @app.route("/")
 def dashboard():

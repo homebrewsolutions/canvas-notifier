@@ -80,6 +80,54 @@ def get_upcoming_assignments(access_token: str = None) -> list[dict]:
     return assignments
 
 
+def get_grades(access_token: str = None) -> list[dict]:
+    """
+    Return current grades for all active courses.
+
+    Calls GET /api/v1/courses with total_scores included.
+    """
+    token = access_token or os.getenv("CANVAS_ACCESS_TOKEN")
+    if not token:
+        raise ValueError("No Canvas access token. Please log in.")
+
+    resp = requests.get(
+        f"{CANVAS_BASE}/api/v1/courses",
+        params={
+            "access_token":    token,
+            "enrollment_state": "active",
+            "include[]":       "total_scores",
+            "per_page":        50,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    courses = resp.json()
+
+    if not isinstance(courses, list):
+        return []
+
+    grades = []
+    for course in courses:
+        # Canvas nests grade info inside the enrollments array
+        enrollment = next((e for e in course.get("enrollments", [])
+                           if e.get("type") == "student"), None)
+        if not enrollment:
+            continue
+
+        score = enrollment.get("computed_current_score")
+        grade = enrollment.get("computed_current_grade")
+
+        grades.append({
+            "course":  course.get("name") or course.get("course_code") or "Unknown Course",
+            "score":   score,   # numeric e.g. 92.5
+            "grade":   grade,   # letter  e.g. "A"
+            "url":     f"{CANVAS_BASE}/courses/{course['id']}",
+        })
+
+    grades.sort(key=lambda x: x["course"])
+    return grades
+
+
 # ─────────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────────

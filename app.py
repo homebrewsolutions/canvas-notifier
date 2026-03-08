@@ -17,7 +17,7 @@ from flask import Flask, request, render_template_string, jsonify, redirect, url
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 
-from canvas import get_upcoming_assignments
+from canvas import get_upcoming_assignments, get_grades
 from ai import answer_question, summarize_assignments, generate_study_schedule
 from notifier import send_sms
 try:
@@ -233,6 +233,26 @@ DASHBOARD_HTML = """
       margin-top: 12px;
     }
     .sms-btn:hover { background: #d4a00d; }
+    .grades-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+    }
+    .grade-item {
+      background: #111;
+      border-radius: 8px;
+      padding: 14px 16px;
+      border-left: 4px solid #444;
+    }
+    .grade-item.a  { border-color: #4caf50; }
+    .grade-item.b  { border-color: #7eb3ff; }
+    .grade-item.c  { border-color: #ffa500; }
+    .grade-item.d  { border-color: #ff6b6b; }
+    .grade-item.f  { border-color: #ff4d4d; }
+    .grade-course { font-size: 0.85rem; color: #aaa; margin-bottom: 8px; line-height: 1.4; }
+    .grade-score  { font-size: 1.6rem; font-weight: 700; color: #fff; }
+    .grade-letter { font-size: 0.9rem; color: #888; margin-left: 6px; }
+    .grade-na     { font-size: 0.9rem; color: #555; }
   </style>
 </head>
 <body>
@@ -265,6 +285,12 @@ DASHBOARD_HTML = """
       <div class="card">
         <h2>📅 Suggested Study Schedule</h2>
         <div id="schedule">Loading...</div>
+      </div>
+
+      <!-- Grades -->
+      <div class="card span-full">
+        <h2>📊 Current Grades</h2>
+        <div id="grades">Loading...</div>
       </div>
 
       <!-- Ask AI -->
@@ -335,16 +361,19 @@ DASHBOARD_HTML = """
       document.getElementById('ai-summary').textContent = 'Loading...';
       document.getElementById('assignments').innerHTML = '<p class="loading">Fetching from Canvas...</p>';
       document.getElementById('schedule').innerHTML = '<p class="loading">Generating schedule...</p>';
+      document.getElementById('grades').innerHTML = '<p class="loading">Fetching grades...</p>';
 
-      const [summaryRes, assignRes, schedRes] = await Promise.all([
+      const [summaryRes, assignRes, schedRes, gradesRes] = await Promise.all([
         fetch('/api/summary'),
         fetch('/api/assignments'),
-        fetch('/api/schedule')
+        fetch('/api/schedule'),
+        fetch('/api/grades')
       ]);
 
       const summaryData  = await summaryRes.json();
       const assignData   = await assignRes.json();
       const scheduleData = await schedRes.json();
+      const gradesData   = await gradesRes.json();
 
       cachedAssignments = assignData.assignments || [];
 
@@ -373,6 +402,30 @@ DASHBOARD_HTML = """
               <h3>${day.day}</h3>
               <ul>${(day.tasks || []).map(t => `<li>${t}</li>`).join('')}</ul>
             </div>`).join('');
+      }
+
+      // Grades
+      const gDiv = document.getElementById('grades');
+      const grades = gradesData.grades || [];
+      if (grades.length === 0) {
+        gDiv.innerHTML = '<p style="color:#555">No grade data available.</p>';
+      } else {
+        gDiv.innerHTML = '<div class="grades-grid">' +
+          grades.map(g => {
+            const letter = (g.grade || '').toUpperCase();
+            const cls    = letter ? letter[0].toLowerCase() : '';
+            const score  = g.score != null ? `${g.score.toFixed(1)}%` : null;
+            return `
+              <a href="${g.url}" target="_blank" style="text-decoration:none">
+                <div class="grade-item ${cls}">
+                  <div class="grade-course">${g.course}</div>
+                  ${score
+                    ? `<div><span class="grade-score">${score}</span><span class="grade-letter">${letter || ''}</span></div>`
+                    : `<div class="grade-na">No grade yet</div>`}
+                </div>
+              </a>`;
+          }).join('') +
+        '</div>';
       }
     }
 
@@ -457,6 +510,15 @@ def api_schedule():
         return jsonify(schedule)
     except Exception as e:
         return jsonify({"summary": f"Error: {str(e)}", "schedule": []}), 500
+
+
+@app.route("/api/grades")
+def api_grades():
+    try:
+        grades = get_grades(access_token=get_access_token())
+        return jsonify({"grades": grades})
+    except Exception as e:
+        return jsonify({"grades": [], "error": str(e)}), 500
 
 
 @app.route("/api/ask", methods=["POST"])

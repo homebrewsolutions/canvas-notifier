@@ -51,24 +51,49 @@ def start_login(email: str, password: str) -> dict:
             _session["browser"] = browser
             _session["page"]    = page
 
-        # Howard Canvas → Microsoft SSO redirect
-        page.goto(f"{CANVAS_URL}/login/saml", wait_until="networkidle", timeout=30_000)
+        # Navigate to Canvas — it will redirect to Microsoft SSO automatically
+        page.goto(CANVAS_URL, wait_until="networkidle", timeout=30_000)
 
-        # Fill Microsoft email
-        _wait_and_fill(page, 'input[name="loginfmt"], input[type="email"]', email)
-        _click(page, '#idSIButton9, input[type="submit"]')
-        page.wait_for_load_state("networkidle", timeout=15_000)
+        # If already on Canvas (cached session), finish immediately
+        if _on_canvas(page):
+            return _finish(page)
 
-        # Fill Microsoft password
-        _wait_and_fill(page, 'input[name="passwd"], input[type="password"]', password)
-        _click(page, '#idSIButton9, input[type="submit"]')
+        # Wait for Microsoft email field
+        try:
+            page.wait_for_selector('input[name="loginfmt"], input[type="email"]', timeout=15_000)
+        except PlaywrightTimeout:
+            url = page.url
+            _cleanup()
+            return _set(status="error", message=f"Could not reach Microsoft login page. Landed on: {url}")
+
+        # Fill email and click Next
+        page.fill('input[name="loginfmt"]', email)
+        page.click('#idSIButton9')
+
+        # Wait for password field
+        try:
+            page.wait_for_selector('input[name="passwd"]', timeout=15_000)
+        except PlaywrightTimeout:
+            url = page.url
+            _cleanup()
+            return _set(status="error", message=f"Email step failed or not recognised. Page: {url}")
+
+        # Check for email-step error (e.g. account not found)
+        if _has_error(page):
+            msg = _error_text(page)
+            _cleanup()
+            return _set(status="error", message=msg or f"Email not recognised. Page: {page.url}")
+
+        # Fill password and sign in
+        page.fill('input[name="passwd"]', password)
+        page.click('#idSIButton9')
         page.wait_for_load_state("networkidle", timeout=15_000)
 
         # Check for bad credentials
         if _has_error(page):
             msg = _error_text(page)
             _cleanup()
-            return _set(status="error", message=msg or "Incorrect email or password.")
+            return _set(status="error", message=msg or f"Incorrect password. Page: {page.url}")
 
         # Already on Canvas (no 2FA)?
         if _on_canvas(page):

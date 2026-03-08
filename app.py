@@ -37,13 +37,21 @@ def get_access_token():
     return flask_session.get('canvas_access_token') or os.getenv('CANVAS_ACCESS_TOKEN')
 
 
+def get_phone():
+    """Return the user's phone number from the session, falling back to .env."""
+    return flask_session.get('user_phone') or os.getenv('TWILIO_TO')
+
+
 @app.before_request
 def require_auth():
-    """Redirect to /setup if the user isn't logged in yet."""
+    """Redirect to /setup or /setup/phone if not fully configured."""
     exempt = ('/setup', '/sms')
-    if not any(request.path.startswith(e) for e in exempt):
-        if not get_access_token():
-            return redirect(url_for('setup'))
+    if any(request.path.startswith(e) for e in exempt):
+        return
+    if not get_access_token():
+        return redirect(url_for('setup'))
+    if not get_phone() and request.path != '/setup/phone':
+        return redirect(url_for('setup_phone'))
 
 # ─────────────────────────────────────────────
 #  DASHBOARD HTML
@@ -463,7 +471,7 @@ def api_send_digest():
     try:
         assignments = get_upcoming_assignments(access_token=get_access_token())
         summary     = summarize_assignments(assignments)
-        send_sms(summary)
+        send_sms(summary, to=get_phone())
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -675,7 +683,7 @@ SETUP_HTML = """
   async function saveAndRedirect() {
     await fetch('/setup/complete', { method: 'POST' });
     show('view-success');
-    setTimeout(() => window.location.href = '/', 1500);
+    setTimeout(() => window.location.href = '/setup/phone', 1500);
   }
 </script>
 </body>
@@ -731,6 +739,93 @@ def setup_complete():
         flask_session["canvas_access_token"] = result["token"]
         return jsonify({"ok": True})
     return jsonify({"ok": False}), 400
+
+
+# ─────────────────────────────────────────────
+#  PHONE SETUP PAGE
+# ─────────────────────────────────────────────
+
+PHONE_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Your Phone Number — Canvas Assistant</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #0d0d0d;
+      color: #e8e8e8;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .container { width: 100%; max-width: 440px; padding: 24px; }
+    .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 14px; padding: 36px 32px; }
+    .logo { font-size: 2rem; margin-bottom: 12px; }
+    h1 { font-size: 1.3rem; color: #fff; margin-bottom: 6px; }
+    .subtitle { font-size: 0.88rem; color: #777; margin-bottom: 24px; line-height: 1.6; }
+    label { display: block; font-size: 0.8rem; color: #aaa; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .04em; }
+    input[type="tel"] {
+      width: 100%; background: #111; border: 1px solid #333; border-radius: 8px;
+      padding: 11px 14px; color: #eee; font-size: 0.9rem; margin-bottom: 16px; outline: none;
+    }
+    input:focus { border-color: #7eb3ff; }
+    .hint { font-size: 0.78rem; color: #555; margin-top: -10px; margin-bottom: 18px; }
+    .btn {
+      display: block; width: 100%; background: #003a8c; color: white; border: none;
+      border-radius: 8px; padding: 13px; font-size: 0.95rem; cursor: pointer; font-weight: 600;
+    }
+    .btn:hover { background: #0055cc; }
+    .alert { padding: 12px 16px; border-radius: 8px; font-size: 0.88rem; margin-bottom: 18px; line-height: 1.5; }
+    .alert-error { background: #3d0000; border-left: 4px solid #ff4d4d; color: #ff9999; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="card">
+    <div class="logo">📱</div>
+    <h1>Where should we text you?</h1>
+    <p class="subtitle">Enter your phone number to receive your daily assignment digest and reply with questions.</p>
+
+    {% if error %}
+      <div class="alert alert-error">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST" action="/setup/phone">
+      <label for="phone">Phone Number</label>
+      <input type="tel" id="phone" name="phone" required autofocus
+             placeholder="+12025551234" value="{{ current or '' }}"/>
+      <p class="hint">Include country code — e.g. +1 for US numbers</p>
+      <button type="submit" class="btn">Save &amp; Go to Dashboard</button>
+    </form>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+
+@app.route("/setup/phone", methods=["GET", "POST"])
+def setup_phone():
+    if request.method == "GET":
+        return render_template_string(PHONE_HTML, error=None,
+                                      current=flask_session.get("user_phone"))
+
+    phone = request.form.get("phone", "").strip()
+
+    # Basic validation — must start with + and have at least 10 digits
+    import re
+    digits = re.sub(r"\D", "", phone)
+    if not phone.startswith("+") or len(digits) < 10:
+        return render_template_string(PHONE_HTML, error="Please enter a valid phone number with country code (e.g. +12025551234).",
+                                      current=phone)
+
+    flask_session["user_phone"] = phone
+    return redirect(url_for("dashboard"))
 
 
 # ─────────────────────────────────────────────

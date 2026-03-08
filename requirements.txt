@@ -4,4 +4,4 @@ anthropic
 flask
 python-dotenv
 gunicorn
-icalendar
+playwright

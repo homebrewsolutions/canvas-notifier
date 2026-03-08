@@ -20,7 +20,11 @@ from dotenv import load_dotenv
 from canvas import get_upcoming_assignments
 from ai import answer_question, summarize_assignments, generate_study_schedule
 from notifier import send_sms
-from canvas_auth import start_browser_login, get_login_result
+try:
+    from canvas_auth import start_browser_login, get_login_result
+    BROWSER_AUTH = True
+except ImportError:
+    BROWSER_AUTH = False
 
 load_dotenv()
 
@@ -657,6 +661,8 @@ def setup():
 @app.route("/setup/start", methods=["POST"])
 def setup_start():
     """Launch the visible browser in a background thread."""
+    if not BROWSER_AUTH:
+        return jsonify({"ok": False, "error": "Browser auth not available on this server. Set CANVAS_ACCESS_TOKEN env var instead."}), 400
     start_browser_login()
     return jsonify({"ok": True})
 
@@ -680,8 +686,9 @@ def setup_complete():
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
     print("🚀 Starting Canvas Assistant...")
-    print("   Dashboard: http://localhost:5000")
-    print("   SMS webhook: http://localhost:5000/sms")
+    print(f"   Dashboard: http://localhost:{port}")
+    print(f"   SMS webhook: http://localhost:{port}/sms")
     print("   (use ngrok to expose the webhook to Twilio)\n")
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=False, host="0.0.0.0", port=port)

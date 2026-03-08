@@ -43,8 +43,29 @@ def start_login(email: str, password: str) -> dict:
 
     try:
         pw      = sync_playwright().start()
-        browser = pw.chromium.launch(headless=True)
-        page    = browser.new_page()
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+            timezone_id="America/New_York",
+        )
+        # Hide the webdriver flag that Microsoft checks for
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = context.new_page()
 
         with _lock:
             _session["pw"]      = pw
@@ -338,6 +359,7 @@ def _cleanup():
     with _lock:
         pw      = _session.pop("pw", None)
         browser = _session.pop("browser", None)
+        _session.pop("context", None)
         _session.pop("page", None)
     try:
         browser.close()

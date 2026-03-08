@@ -21,7 +21,7 @@ from canvas import get_upcoming_assignments
 from ai import answer_question, summarize_assignments, generate_study_schedule
 from notifier import send_sms
 try:
-    from canvas_auth import start_browser_login, get_login_result
+    from canvas_auth import start_login, submit_code, get_status
     BROWSER_AUTH = True
 except ImportError:
     BROWSER_AUTH = False
@@ -517,49 +517,36 @@ SETUP_HTML = """
       justify-content: center;
     }
     .container { width: 100%; max-width: 460px; padding: 24px; }
-    .card {
-      background: #1a1a1a;
-      border: 1px solid #2a2a2a;
-      border-radius: 14px;
-      padding: 36px 32px;
-    }
+    .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 14px; padding: 36px 32px; }
     .logo { font-size: 2rem; margin-bottom: 12px; }
     h1 { font-size: 1.3rem; color: #fff; margin-bottom: 6px; }
-    .subtitle { font-size: 0.88rem; color: #777; margin-bottom: 28px; line-height: 1.6; }
+    .subtitle { font-size: 0.88rem; color: #777; margin-bottom: 24px; line-height: 1.6; }
+    label { display: block; font-size: 0.8rem; color: #aaa; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .04em; }
+    input[type="email"], input[type="password"], input[type="text"] {
+      width: 100%; background: #111; border: 1px solid #333; border-radius: 8px;
+      padding: 11px 14px; color: #eee; font-size: 0.9rem; margin-bottom: 16px; outline: none;
+    }
+    input:focus { border-color: #7eb3ff; }
     .btn {
-      display: block;
-      width: 100%;
-      background: #003a8c;
-      color: white;
-      border: none;
-      border-radius: 8px;
-      padding: 13px;
-      font-size: 0.95rem;
-      cursor: pointer;
-      font-weight: 600;
-      text-align: center;
-      text-decoration: none;
+      display: block; width: 100%; background: #003a8c; color: white; border: none;
+      border-radius: 8px; padding: 13px; font-size: 0.95rem; cursor: pointer;
+      font-weight: 600; text-align: center;
     }
     .btn:hover { background: #0055cc; }
     .btn:disabled { background: #222; color: #555; cursor: default; }
-    .alert { padding: 12px 16px; border-radius: 8px; font-size: 0.88rem; margin-bottom: 20px; line-height: 1.5; }
+    .alert { padding: 12px 16px; border-radius: 8px; font-size: 0.88rem; margin-bottom: 18px; line-height: 1.5; }
     .alert-error   { background: #3d0000; border-left: 4px solid #ff4d4d; color: #ff9999; }
     .alert-success { background: #002d00; border-left: 4px solid #4caf50; color: #88e888; }
     .alert-info    { background: #001a33; border-left: 4px solid #7eb3ff; color: #9ecfff; }
-    .waiting-box { text-align: center; padding: 8px 0 20px; }
     .spinner-ring {
-      display: inline-block;
-      width: 40px; height: 40px;
-      border: 4px solid #2a2a2a;
-      border-top-color: #7eb3ff;
-      border-radius: 50%;
-      animation: spin 0.9s linear infinite;
-      margin-bottom: 16px;
+      display: inline-block; width: 36px; height: 36px;
+      border: 4px solid #2a2a2a; border-top-color: #7eb3ff;
+      border-radius: 50%; animation: spin 0.9s linear infinite; margin-bottom: 14px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .waiting-box { text-align: center; padding: 4px 0 18px; }
     .waiting-box p { font-size: 0.9rem; color: #aaa; line-height: 1.6; }
-    .waiting-box strong { color: #e8e8e8; }
-    .retry-link { display: block; text-align: center; margin-top: 16px; font-size: 0.82rem; color: #555; text-decoration: none; }
+    .retry-link { display: block; text-align: center; margin-top: 14px; font-size: 0.82rem; color: #555; text-decoration: none; }
     .retry-link:hover { color: #7eb3ff; }
   </style>
 </head>
@@ -567,81 +554,128 @@ SETUP_HTML = """
 <div class="container">
   <div class="card">
 
-    <div id="view-idle">
+    <!-- Step 1: Email + Password -->
+    <div id="view-login">
       <div class="logo">📚</div>
       <h1>Sign in to Canvas</h1>
-      <p class="subtitle">
-        Click below to open a browser window where you can sign in with your
-        Howard University Microsoft account — including 2FA — just like normal.
-        Once you're in, we'll handle the rest automatically.
-      </p>
+      <p class="subtitle">Enter your Howard University Microsoft account credentials.</p>
       <div id="error-box" style="display:none" class="alert alert-error"></div>
-      <button class="btn" onclick="startLogin()">Open Sign-In Window</button>
+      <label>Howard Email</label>
+      <input type="email" id="email" placeholder="you@howard.edu" autocomplete="email"/>
+      <label>Password</label>
+      <input type="password" id="password" placeholder="Your Microsoft password" autocomplete="current-password"/>
+      <button class="btn" id="login-btn" onclick="submitLogin()">Sign In</button>
     </div>
 
-    <div id="view-waiting" style="display:none">
-      <div class="logo">🔐</div>
-      <h1>Complete sign-in</h1>
+    <!-- Step 2a: Authenticator push — just wait -->
+    <div id="view-push" style="display:none">
+      <div class="logo">📱</div>
+      <h1>Check your phone</h1>
       <div class="waiting-box">
         <div class="spinner-ring"></div>
-        <p>
-          <strong>A browser window has opened.</strong><br>
-          Sign in with your Howard University account there,<br>
-          including any 2FA prompts. This page will update automatically.
-        </p>
+        <p id="push-prompt">Approve the sign-in request in your Microsoft Authenticator app.</p>
       </div>
-      <a class="retry-link" href="/setup">Cancel and start over</a>
+      <a class="retry-link" href="/setup">Start over</a>
     </div>
 
+    <!-- Step 2b: Enter a code (TOTP / SMS) -->
+    <div id="view-code" style="display:none">
+      <div class="logo">🔐</div>
+      <h1>Enter verification code</h1>
+      <p class="subtitle" id="code-prompt">Enter the code from your authenticator app or SMS.</p>
+      <div id="code-error-box" style="display:none" class="alert alert-error"></div>
+      <label>Verification Code</label>
+      <input type="text" id="code-input" placeholder="123456" inputmode="numeric" autocomplete="one-time-code"/>
+      <button class="btn" id="code-btn" onclick="submitCode()">Verify</button>
+      <a class="retry-link" href="/setup">Start over</a>
+    </div>
+
+    <!-- Done -->
     <div id="view-success" style="display:none">
       <div class="logo">✅</div>
       <h1>You're connected!</h1>
-      <div class="alert alert-success">
-        Canvas account linked. Redirecting to your dashboard...
-      </div>
+      <div class="alert alert-success">Canvas account linked. Redirecting...</div>
     </div>
 
   </div>
 </div>
 
 <script>
-  async function startLogin() {
-    document.getElementById('error-box').style.display = 'none';
-    document.getElementById('view-idle').style.display = 'none';
-    document.getElementById('view-waiting').style.display = 'block';
+  function show(id) {
+    ['view-login','view-push','view-code','view-success'].forEach(v =>
+      document.getElementById(v).style.display = v === id ? 'block' : 'none'
+    );
+  }
 
-    // Tell the server to launch the browser
-    const res = await fetch('/setup/start', { method: 'POST' });
-    if (!res.ok) {
-      showError('Could not start the login process. Is the server running?');
-      return;
-    }
+  function setError(boxId, msg) {
+    const b = document.getElementById(boxId);
+    b.textContent = msg;
+    b.style.display = msg ? 'block' : 'none';
+  }
 
-    // Poll for result every 2 seconds
-    const interval = setInterval(async () => {
-      const r = await fetch('/setup/status');
+  async function submitLogin() {
+    const email    = document.getElementById('email').value.trim();
+    const password = document.getElementById('password').value;
+    if (!email || !password) { setError('error-box', 'Please enter your email and password.'); return; }
+
+    const btn = document.getElementById('login-btn');
+    btn.disabled = true;
+    btn.textContent = 'Signing in...';
+    setError('error-box', '');
+
+    const res  = await fetch('/setup/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ email, password })
+    });
+    const data = await res.json();
+
+    if (data.status === 'success')    { saveAndRedirect(); return; }
+    if (data.status === 'needs_push') { show('view-push'); document.getElementById('push-prompt').textContent = data.prompt || ''; startPolling(); return; }
+    if (data.status === 'needs_code') { show('view-code'); document.getElementById('code-prompt').textContent = data.prompt || ''; return; }
+
+    // error
+    btn.disabled = false;
+    btn.textContent = 'Sign In';
+    setError('error-box', data.message || 'Login failed. Please try again.');
+  }
+
+  async function submitCode() {
+    const code = document.getElementById('code-input').value.trim();
+    if (!code) { setError('code-error-box', 'Please enter the code.'); return; }
+
+    const btn = document.getElementById('code-btn');
+    btn.disabled = true;
+    btn.textContent = 'Verifying...';
+    setError('code-error-box', '');
+
+    const res  = await fetch('/setup/code', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ code })
+    });
+    const data = await res.json();
+
+    if (data.status === 'success') { saveAndRedirect(); return; }
+
+    btn.disabled = false;
+    btn.textContent = 'Verify';
+    setError('code-error-box', data.message || 'Invalid code. Please try again.');
+  }
+
+  function startPolling() {
+    const iv = setInterval(async () => {
+      const r    = await fetch('/setup/status');
       const data = await r.json();
-
-      if (data.status === 'success') {
-        clearInterval(interval);
-        // Save token to session then go to dashboard
-        await fetch('/setup/complete', { method: 'POST' });
-        document.getElementById('view-waiting').style.display = 'none';
-        document.getElementById('view-success').style.display = 'block';
-        setTimeout(() => window.location.href = '/', 1500);
-      } else if (data.status === 'error') {
-        clearInterval(interval);
-        showError(data.message || 'Login failed. Please try again.');
-      }
+      if (data.status === 'success') { clearInterval(iv); saveAndRedirect(); }
+      if (data.status === 'error')   { clearInterval(iv); show('view-login'); setError('error-box', data.message || 'Login failed.'); }
     }, 2000);
   }
 
-  function showError(msg) {
-    document.getElementById('view-waiting').style.display = 'none';
-    document.getElementById('view-idle').style.display = 'block';
-    const box = document.getElementById('error-box');
-    box.textContent = msg;
-    box.style.display = 'block';
+  async function saveAndRedirect() {
+    await fetch('/setup/complete', { method: 'POST' });
+    show('view-success');
+    setTimeout(() => window.location.href = '/', 1500);
   }
 </script>
 </body>
@@ -658,29 +692,45 @@ def setup():
     return render_template_string(SETUP_HTML)
 
 
-@app.route("/setup/start", methods=["POST"])
-def setup_start():
-    """Launch the visible browser in a background thread."""
+@app.route("/setup/login", methods=["POST"])
+def setup_login():
+    """Step 1 — submit email + password, kick off SSO."""
     if not BROWSER_AUTH:
-        return jsonify({"ok": False, "error": "Browser auth not available on this server. Set CANVAS_ACCESS_TOKEN env var instead."}), 400
-    start_browser_login()
-    return jsonify({"ok": True})
+        return jsonify({"status": "error", "message": "Auth not available. Set CANVAS_ACCESS_TOKEN env var."}), 400
+    data     = request.get_json()
+    email    = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    if not email or not password:
+        return jsonify({"status": "error", "message": "Email and password are required."})
+    result = start_login(email, password)
+    return jsonify(result)
+
+
+@app.route("/setup/code", methods=["POST"])
+def setup_code():
+    """Step 2b — submit 2FA code."""
+    data   = request.get_json()
+    code   = (data.get("code") or "").strip()
+    if not code:
+        return jsonify({"status": "error", "message": "Code is required."})
+    result = submit_code(code)
+    return jsonify(result)
 
 
 @app.route("/setup/status")
 def setup_status():
-    """Return the current login status for the JS poller."""
-    return jsonify(get_login_result())
+    """Poll endpoint for push notification wait."""
+    return jsonify(get_status())
 
 
 @app.route("/setup/complete", methods=["POST"])
 def setup_complete():
-    """Read the token from the completed login and save it to the session."""
-    result = get_login_result()
+    """Save the token from a successful login into the session."""
+    result = get_status()
     if result.get("status") == "success" and result.get("token"):
         flask_session["canvas_access_token"] = result["token"]
         return jsonify({"ok": True})
-    return jsonify({"ok": False, "error": "No token available"}), 400
+    return jsonify({"ok": False}), 400
 
 
 # ─────────────────────────────────────────────

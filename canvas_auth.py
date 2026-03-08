@@ -1,163 +1,229 @@
 """
-canvas_auth.py — Non-headless Canvas login via Playwright.
+canvas_auth.py — Headless Microsoft SSO login for Howard Canvas.
 
-Opens a real visible browser so the user can complete Microsoft SSO
-and 2FA naturally. After the user logs in, automatically navigates to
-Canvas profile settings, generates an API token, and closes the browser.
+Handles the full login flow programmatically:
+  1. Navigate to Howard Canvas → redirects to Microsoft SSO
+  2. Fill in email + password
+  3. Detect 2FA type (Authenticator push or code entry)
+  4. If code: return prompt so the web UI can ask the user
+  5. If push: wait in background for the user to approve on their phone
+  6. After login: generate a Canvas API token and return it
 
-Call start_browser_login() to kick off the background thread, then
-poll get_login_result() for status updates.
+Works headlessly — no visible browser needed, runs on Railway.
 """
 
 import time
 import threading
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-CANVAS_URL   = "https://howard.instructure.com"
-LOGIN_TIMEOUT = 180  # seconds the user has to complete login
+CANVAS_URL = "https://howard.instructure.com"
 
-_lock   = threading.Lock()
-_result = {"status": "idle"}   # idle | pending | success | error
-
-
-def start_browser_login():
-    """
-    Launch a visible browser window and begin the login flow in a background thread.
-    The user must complete Microsoft SSO + 2FA in the opened window.
-    """
-    with _lock:
-        _result.clear()
-        _result["status"] = "pending"
-
-    t = threading.Thread(target=_login_thread, daemon=True)
-    t.start()
-
-
-def get_login_result() -> dict:
-    """Return a copy of the current login result."""
-    with _lock:
-        return dict(_result)
+_lock    = threading.Lock()
+_state   = {"status": "idle"}   # idle | pending | needs_code | needs_push | success | error
+_session = {}                    # holds playwright / browser / page between requests
 
 
 # ─────────────────────────────────────────────
-#  Internal
+#  Public API
 # ─────────────────────────────────────────────
 
-def _login_thread():
-    playwright = browser = None
+def start_login(email: str, password: str) -> dict:
+    """
+    Begin the SSO login flow synchronously up to the 2FA step.
+
+    Returns one of:
+      {'status': 'success',    'token': '...'}
+      {'status': 'needs_code', 'prompt': '...'}   ← app should ask user for code
+      {'status': 'needs_push', 'prompt': '...'}   ← app should tell user to check phone;
+                                                     poll get_status() until success/error
+      {'status': 'error',      'message': '...'}
+    """
+    _cleanup()
+    _set(status="pending")
+
     try:
-        playwright = sync_playwright().start()
-        browser    = playwright.chromium.launch(headless=False)
-        page       = browser.new_page()
+        pw      = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True)
+        page    = browser.new_page()
 
-        # Go to Canvas — Howard will redirect to Microsoft SSO automatically
-        page.goto(f"{CANVAS_URL}/login/saml", timeout=30_000)
+        with _lock:
+            _session["pw"]      = pw
+            _session["browser"] = browser
+            _session["page"]    = page
 
-        # Wait for the user to finish logging in (up to LOGIN_TIMEOUT seconds)
-        logged_in = _wait_for_login(page)
+        # Howard Canvas → Microsoft SSO redirect
+        page.goto(f"{CANVAS_URL}/login/saml", wait_until="networkidle", timeout=30_000)
 
-        if not logged_in:
-            _set(status="error", message="Login timed out. Please try again.")
-            return
+        # Fill Microsoft email
+        _wait_and_fill(page, 'input[name="loginfmt"], input[type="email"]', email)
+        _click(page, '#idSIButton9, input[type="submit"]')
+        page.wait_for_load_state("networkidle", timeout=15_000)
 
-        # User is on Canvas — quietly generate an API token in the same session
-        token = _generate_api_token(page)
+        # Fill Microsoft password
+        _wait_and_fill(page, 'input[name="passwd"], input[type="password"]', password)
+        _click(page, '#idSIButton9, input[type="submit"]')
+        page.wait_for_load_state("networkidle", timeout=15_000)
 
-        if token:
-            _set(status="success", token=token)
-        else:
-            _set(status="error",
-                 message="Logged in, but could not generate a Canvas API token. "
-                         "Try going to Canvas → Settings → New Access Token manually.")
+        # Check for bad credentials
+        if _has_error(page):
+            msg = _error_text(page)
+            _cleanup()
+            return _set(status="error", message=msg or "Incorrect email or password.")
+
+        # Already on Canvas (no 2FA)?
+        if _on_canvas(page):
+            return _finish(page)
+
+        # Detect 2FA type
+        twofa = _detect_2fa(page)
+
+        if twofa == "code":
+            prompt = _get_2fa_prompt(page)
+            _set(status="needs_code", prompt=prompt)
+            return {"status": "needs_code", "prompt": prompt}
+
+        if twofa == "push":
+            prompt = _get_2fa_prompt(page)
+            _set(status="needs_push", prompt=prompt)
+            # Wait for phone approval in background
+            t = threading.Thread(target=_wait_for_push, daemon=True)
+            t.start()
+            return {"status": "needs_push", "prompt": prompt}
+
+        # "Stay signed in?" prompt — click No and proceed
+        if _has_stay_signed_in(page):
+            _click(page, '#idBtn_Back, input[value="No"]')
+            page.wait_for_load_state("networkidle", timeout=10_000)
+            if _on_canvas(page):
+                return _finish(page)
+
+        _cleanup()
+        return _set(status="error",
+                    message=f"Unexpected page after login: {page.url}. "
+                            "Howard may have changed their SSO flow.")
 
     except PlaywrightTimeout:
-        _set(status="error", message="Browser timed out. Please try again.")
+        _cleanup()
+        return _set(status="error", message="Login timed out. Check your credentials and try again.")
+    except Exception as e:
+        _cleanup()
+        return _set(status="error", message=str(e))
+
+
+def submit_code(code: str) -> dict:
+    """
+    Submit a 2FA verification code (TOTP / SMS).
+
+    Returns one of:
+      {'status': 'success', 'token': '...'}
+      {'status': 'error',   'message': '...'}
+    """
+    with _lock:
+        page = _session.get("page")
+
+    if not page:
+        return _set(status="error", message="No active login session. Please start over.")
+
+    try:
+        _wait_and_fill(page, 'input[name="otc"], input[name="code"], input[autocomplete="one-time-code"]', code)
+        _click(page, '#idSubmit_SAOTCC_Continue, #idSIButton9, input[type="submit"]')
+        page.wait_for_load_state("networkidle", timeout=15_000)
+
+        if _has_error(page):
+            return _set(status="error", message=_error_text(page) or "Invalid code. Please try again.")
+
+        if _has_stay_signed_in(page):
+            _click(page, '#idBtn_Back, input[value="No"]')
+            page.wait_for_load_state("networkidle", timeout=10_000)
+
+        if _on_canvas(page):
+            return _finish(page)
+
+        return _set(status="error", message="Code accepted but could not reach Canvas.")
+
+    except PlaywrightTimeout:
+        _cleanup()
+        return _set(status="error", message="Timed out after code submission.")
+    except Exception as e:
+        _cleanup()
+        return _set(status="error", message=str(e))
+
+
+def get_status() -> dict:
+    """Return the current auth state (for polling)."""
+    with _lock:
+        return dict(_state)
+
+
+# ─────────────────────────────────────────────
+#  Internal helpers
+# ─────────────────────────────────────────────
+
+def _wait_for_push():
+    """Background thread: poll until Microsoft push is approved or times out."""
+    with _lock:
+        page = _session.get("page")
+    if not page:
+        return
+
+    try:
+        for _ in range(150):   # 5 minutes
+            time.sleep(2)
+            try:
+                if _has_stay_signed_in(page):
+                    _click(page, '#idBtn_Back, input[value="No"]')
+                    page.wait_for_load_state("networkidle", timeout=10_000)
+
+                if _on_canvas(page):
+                    _finish(page)
+                    return
+            except Exception:
+                pass
+
+        _set(status="error", message="Push notification timed out. Please try again.")
     except Exception as e:
         _set(status="error", message=str(e))
     finally:
-        try:
-            browser.close()
-        except Exception:
-            pass
-        try:
-            playwright.stop()
-        except Exception:
-            pass
+        _cleanup()
 
 
-def _wait_for_login(page) -> bool:
-    """Poll every second until the user reaches the Canvas dashboard or times out."""
-    for _ in range(LOGIN_TIMEOUT):
-        time.sleep(1)
-        try:
-            url = page.url
-            if CANVAS_URL not in url:
-                continue
-            on_dashboard = (
-                "/dashboard" in url
-                or url.rstrip("/") == CANVAS_URL
-                or page.locator(
-                    "#dashboard_header_container, "
-                    ".ic-Dashboard-header, "
-                    "#application"
-                ).count() > 0
-            )
-            if on_dashboard:
-                return True
-        except Exception:
-            # Page may be navigating; keep waiting
-            pass
-    return False
+def _finish(page) -> dict:
+    """Generate a Canvas API token and return success."""
+    token = _generate_api_token(page)
+    _cleanup()
+    if token:
+        return _set(status="success", token=token)
+    return _set(status="error",
+                message="Logged in but could not generate a Canvas API token.")
 
 
 def _generate_api_token(page) -> str | None:
-    """Navigate to profile settings and create a new Canvas API access token."""
     try:
-        page.goto(f"{CANVAS_URL}/profile/settings",
-                  wait_until="networkidle", timeout=15_000)
+        page.goto(f"{CANVAS_URL}/profile/settings", wait_until="networkidle", timeout=15_000)
 
-        # Click "New Access Token"
         btn = page.locator(
-            'a[href="#access_token_form"], '
-            '.add_access_token_link, '
-            'button:has-text("New Access Token"), '
-            'a:has-text("New Access Token")'
+            'a[href="#access_token_form"], .add_access_token_link, '
+            'button:has-text("New Access Token"), a:has-text("New Access Token")'
         ).first
         btn.click()
 
-        # Wait for the modal/form
         page.wait_for_selector(
-            '#access_token_form, #access-token-form, '
-            '[data-testid="access-token-form"]',
+            '#access_token_form, #access-token-form, [data-testid="access-token-form"]',
             timeout=8_000
         )
 
-        # Fill in a purpose so it's identifiable later
-        purpose = page.locator(
-            'input[name="access_token[purpose]"], #access_token_purpose'
-        ).first
+        purpose = page.locator('input[name="access_token[purpose]"], #access_token_purpose').first
         if purpose.count() > 0:
             purpose.fill("Canvas Notifier")
 
-        # Submit
-        page.locator(
-            'button:has-text("Generate Token"), input[value="Generate Token"]'
-        ).first.click()
+        page.locator('button:has-text("Generate Token"), input[value="Generate Token"]').first.click()
 
-        # Wait for the token value to appear
         page.wait_for_selector(
-            '.visible_token, #token_value, '
-            '[data-testid="access-token-value"], input.token-value',
+            '.visible_token, #token_value, [data-testid="access-token-value"], input.token-value',
             timeout=10_000
         )
 
-        # Extract the token text
-        for sel in [
-            '.visible_token',
-            '#token_value',
-            '[data-testid="access-token-value"]',
-            'input.token-value',
-        ]:
+        for sel in ['.visible_token', '#token_value', '[data-testid="access-token-value"]', 'input.token-value']:
             el = page.locator(sel).first
             if el.count() > 0:
                 tag   = el.evaluate("e => e.tagName")
@@ -165,14 +231,94 @@ def _generate_api_token(page) -> str | None:
                 token = (token or "").strip()
                 if len(token) > 10:
                     return token
-
         return None
-
     except Exception:
         return None
 
 
-def _set(**kwargs):
+def _detect_2fa(page) -> str | None:
+    """Return 'code', 'push', or None."""
+    html = page.content().lower()
+    if any(k in html for k in ["otc", "verification code", "enter the code", "one-time"]):
+        return "code"
+    if any(k in html for k in ["approve sign in", "open your authenticator", "push notification", "number matching"]):
+        return "push"
+    return None
+
+
+def _get_2fa_prompt(page) -> str:
+    for sel in [".text-title", "#idDiv_SAOTCS_Title", "#idDiv_SAOTCC_Title", "h1", ".title"]:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                text = el.text_content().strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+    return "Complete two-factor authentication."
+
+
+def _has_error(page) -> bool:
+    try:
+        err = page.locator('#idTd_Tile_ErrorMessage, .alert-error, [aria-live="assertive"]').first
+        return err.count() > 0 and bool((err.text_content() or "").strip())
+    except Exception:
+        return False
+
+
+def _error_text(page) -> str:
+    try:
+        return page.locator('#idTd_Tile_ErrorMessage, .alert-error, [aria-live="assertive"]').first.text_content().strip()
+    except Exception:
+        return ""
+
+
+def _on_canvas(page) -> bool:
+    try:
+        url = page.url
+        return CANVAS_URL in url and (
+            "/dashboard" in url
+            or url.rstrip("/") == CANVAS_URL
+            or page.locator("#dashboard_header_container, .ic-Dashboard-header").count() > 0
+        )
+    except Exception:
+        return False
+
+
+def _has_stay_signed_in(page) -> bool:
+    try:
+        return page.locator('#idBtn_Back, input[value="No"]').count() > 0
+    except Exception:
+        return False
+
+
+def _wait_and_fill(page, selector: str, value: str):
+    page.wait_for_selector(selector, timeout=10_000)
+    page.fill(selector.split(",")[0].strip(), value)
+
+
+def _click(page, selector: str):
+    page.locator(selector).first.click()
+
+
+def _set(**kwargs) -> dict:
     with _lock:
-        _result.clear()
-        _result.update(kwargs)
+        _state.clear()
+        _state.update(kwargs)
+    return dict(kwargs)
+
+
+def _cleanup():
+    with _lock:
+        pw      = _session.pop("pw", None)
+        browser = _session.pop("browser", None)
+        _session.pop("page", None)
+    try:
+        browser.close()
+    except Exception:
+        pass
+    try:
+        pw.stop()
+    except Exception:
+        pass

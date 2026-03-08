@@ -1,61 +1,67 @@
 """
-canvas.py — Fetches upcoming assignments from a Canvas ICS calendar feed.
-No API token required — uses the personal calendar feed URL from Canvas.
+canvas.py — Fetches upcoming assignments via the AnySiteMCP server.
+
+Uses howard_canvas_get_calendar_events (type=assignment) so no ICS feed
+URL is needed — just a Canvas API access token obtained at login.
 """
 
 import os
-import requests
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
-from icalendar import Calendar
 from dotenv import load_dotenv
+
+from mcp_client import call_tool
 
 load_dotenv()
 
-DAYS_AHEAD  = int(os.getenv("DAYS_AHEAD", 14))
+DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", 14))
 DISPLAY_TZ  = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
 
 
-def get_upcoming_assignments(feed_url=None):
-    """Return a list of assignments due in the next DAYS_AHEAD days from a Canvas ICS feed."""
-    feed_url = feed_url or os.getenv("CANVAS_FEED_URL")
-    if not feed_url:
-        raise ValueError("No Canvas calendar feed URL found. Please connect your Canvas account.")
+def get_upcoming_assignments(access_token: str = None) -> list[dict]:
+    """
+    Return assignments due in the next DAYS_AHEAD days.
 
-    resp = requests.get(feed_url, timeout=15)
-    resp.raise_for_status()
+    Calls howard_canvas_get_calendar_events via the MCP server.
+    Falls back to CANVAS_ACCESS_TOKEN env var if access_token is not provided.
+    """
+    token = access_token or os.getenv("CANVAS_ACCESS_TOKEN")
+    if not token:
+        raise ValueError("No Canvas access token. Please log in.")
 
-    cal      = Calendar.from_ical(resp.content)
     now      = datetime.now(timezone.utc)
-    now_local = now.astimezone(DISPLAY_TZ)
     end      = now + timedelta(days=DAYS_AHEAD)
+    now_local = now.astimezone(DISPLAY_TZ)
+
+    events = call_tool("howard_canvas_get_calendar_events", {
+        "access_token": token,
+        "start_date":   now.date().isoformat(),
+        "end_date":     end.date().isoformat(),
+        "type":         "assignment",
+        "per_page":     100,
+    })
+
+    # Canvas returns a list; normalise to list
+    if isinstance(events, dict):
+        events = events.get("items", events.get("events", [events]))
+    if not isinstance(events, list):
+        events = []
 
     assignments = []
-
-    for component in cal.walk():
-        if component.name != 'VEVENT':
+    for ev in events:
+        due_dt = _parse_dt(ev.get("start_at") or ev.get("end_at") or ev.get("due_at"))
+        if due_dt is None:
             continue
-
-        # Canvas uses DTSTART for the due date/time
-        dtstart = component.get('DTSTART') or component.get('DUE')
-        if not dtstart:
-            continue
-
-        due_dt = dtstart.dt
-
-        # Normalize to timezone-aware datetime
-        if isinstance(due_dt, date) and not isinstance(due_dt, datetime):
-            due_dt = datetime(due_dt.year, due_dt.month, due_dt.day, 23, 59, tzinfo=timezone.utc)
-        elif due_dt.tzinfo is None:
-            due_dt = due_dt.replace(tzinfo=timezone.utc)
-
         if not (now <= due_dt <= end):
             continue
 
-        summary = str(component.get('SUMMARY', 'Unnamed Assignment'))
-        course, title = _parse_course_and_title(summary, component)
-        url        = str(component.get('URL', ''))
-        description = str(component.get('DESCRIPTION', ''))
+        assignment = ev.get("assignment") or {}
+        course     = ev.get("context_name") or assignment.get("course_id") or "Unknown Course"
+        title      = ev.get("title") or assignment.get("name") or "Unnamed Assignment"
+        points     = assignment.get("points_possible", "?")
+        description = assignment.get("description") or ev.get("description") or ""
+        url         = ev.get("html_url") or assignment.get("html_url") or ""
+
         due_local  = due_dt.astimezone(DISPLAY_TZ)
 
         assignments.append({
@@ -64,8 +70,8 @@ def get_upcoming_assignments(feed_url=None):
             "due":         due_dt,
             "due_str":     due_local.strftime("%A, %b %-d @ %-I:%M %p"),
             "days_left":   (due_local.date() - now_local.date()).days,
-            "points":      "?",
-            "description": description,
+            "points":      points if points != "?" else "?",
+            "description": _strip_html(str(description)),
             "url":         url,
         })
 
@@ -73,26 +79,29 @@ def get_upcoming_assignments(feed_url=None):
     return assignments
 
 
-def _parse_course_and_title(summary, component):
-    """
-    Canvas ICS SUMMARY is usually one of:
-      "[Course Name] Assignment Title"
-      "Assignment Title"
-    Falls back to checking the DESCRIPTION field for a course line.
-    """
-    # Format: "[Course Name] Assignment Title"
-    if summary.startswith('[') and ']' in summary:
-        idx    = summary.index(']')
-        course = summary[1:idx].strip()
-        title  = summary[idx + 1:].strip() or summary
-        return course, title
+# ─────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────
 
-    # Look for "Course: ..." in description
-    description = str(component.get('DESCRIPTION', ''))
-    for line in description.splitlines():
-        lower = line.lower()
-        if lower.startswith('course:') or lower.startswith('class:'):
-            course = line.split(':', 1)[1].strip()
-            return course, summary
+def _parse_dt(value) -> datetime | None:
+    """Parse an ISO-8601 string or date/datetime object into an aware datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, 23, 59, tzinfo=timezone.utc)
+    if isinstance(value, str):
+        value = value.rstrip("Z")
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
 
-    return 'Unknown Course', summary
+
+def _strip_html(text: str) -> str:
+    """Very light HTML-tag stripper so descriptions stay readable."""
+    import re
+    return re.sub(r"<[^>]+>", "", text).strip()

@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from canvas import get_upcoming_assignments
 from ai import answer_question, summarize_assignments, generate_study_schedule
 from notifier import send_sms
+from canvas_auth import start_browser_login, get_login_result
 
 load_dotenv()
 
@@ -27,17 +28,17 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY") or "howard-canvas-x9k2mzp-fallback-key"
 
 
-def get_feed_url():
-    """Return the Canvas ICS feed URL from the user's session, falling back to .env."""
-    return flask_session.get('canvas_feed_url') or os.getenv('CANVAS_FEED_URL')
+def get_access_token():
+    """Return the Canvas API token from the session, falling back to .env."""
+    return flask_session.get('canvas_access_token') or os.getenv('CANVAS_ACCESS_TOKEN')
 
 
 @app.before_request
-def require_canvas_feed():
-    """Redirect to /setup if the user hasn't connected their Canvas account yet."""
+def require_auth():
+    """Redirect to /setup if the user isn't logged in yet."""
     exempt = ('/setup', '/sms')
-    if not request.path.startswith(exempt):
-        if not get_feed_url():
+    if not any(request.path.startswith(e) for e in exempt):
+        if not get_access_token():
             return redirect(url_for('setup'))
 
 # ─────────────────────────────────────────────
@@ -413,7 +414,7 @@ def dashboard():
 @app.route("/api/assignments")
 def api_assignments():
     try:
-        assignments = get_upcoming_assignments(feed_url=get_feed_url())
+        assignments = get_upcoming_assignments(access_token=get_access_token())
         for a in assignments:
             a["due"] = a["due"].isoformat()
         return jsonify({"assignments": assignments})
@@ -424,7 +425,7 @@ def api_assignments():
 @app.route("/api/summary")
 def api_summary():
     try:
-        assignments = get_upcoming_assignments(feed_url=get_feed_url())
+        assignments = get_upcoming_assignments(access_token=get_access_token())
         summary = summarize_assignments(assignments)
         return jsonify({"summary": summary})
     except Exception as e:
@@ -434,7 +435,7 @@ def api_summary():
 @app.route("/api/schedule")
 def api_schedule():
     try:
-        assignments = get_upcoming_assignments(feed_url=get_feed_url())
+        assignments = get_upcoming_assignments(access_token=get_access_token())
         schedule = generate_study_schedule(assignments)
         return jsonify(schedule)
     except Exception as e:
@@ -446,7 +447,7 @@ def api_ask():
     try:
         data        = request.get_json()
         question    = data.get("question", "")
-        assignments = get_upcoming_assignments(feed_url=get_feed_url())
+        assignments = get_upcoming_assignments(access_token=get_access_token())
         answer      = answer_question(question, assignments)
         return jsonify({"answer": answer})
     except Exception as e:
@@ -456,7 +457,7 @@ def api_ask():
 @app.route("/api/send-digest", methods=["POST"])
 def api_send_digest():
     try:
-        assignments = get_upcoming_assignments(feed_url=get_feed_url())
+        assignments = get_upcoming_assignments(access_token=get_access_token())
         summary     = summarize_assignments(assignments)
         send_sms(summary)
         return jsonify({"ok": True})
@@ -466,7 +467,7 @@ def api_send_digest():
 
 @app.route("/logout")
 def logout():
-    flask_session.pop('canvas_feed_url', None)
+    flask_session.pop('canvas_access_token', None)
     return redirect(url_for('setup'))
 
 
@@ -499,7 +500,7 @@ SETUP_HTML = """
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Setup — Canvas Notifier</title>
+  <title>Sign In — Canvas Assistant</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -511,95 +512,134 @@ SETUP_HTML = """
       align-items: center;
       justify-content: center;
     }
-    .container { width: 100%; max-width: 500px; padding: 24px; }
+    .container { width: 100%; max-width: 460px; padding: 24px; }
     .card {
       background: #1a1a1a;
       border: 1px solid #2a2a2a;
       border-radius: 14px;
       padding: 36px 32px;
     }
+    .logo { font-size: 2rem; margin-bottom: 12px; }
     h1 { font-size: 1.3rem; color: #fff; margin-bottom: 6px; }
-    .subtitle { font-size: 0.88rem; color: #777; margin-bottom: 28px; line-height: 1.5; }
-    .steps {
-      background: #111;
-      border-radius: 10px;
-      padding: 18px 20px;
-      margin-bottom: 24px;
-      border-left: 4px solid #b8860b;
-    }
-    .steps p { font-size: 0.82rem; color: #aaa; margin-bottom: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
-    .steps ol { padding-left: 18px; }
-    .steps li { font-size: 0.88rem; color: #ccc; margin-bottom: 8px; line-height: 1.5; }
-    .steps li a { color: #7eb3ff; }
-    .steps code { background: #222; padding: 1px 6px; border-radius: 4px; font-size: 0.82rem; color: #ffa; }
-    label { display: block; font-size: 0.82rem; color: #aaa; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.04em; }
-    input[type="text"] {
-      width: 100%;
-      background: #111;
-      border: 1px solid #333;
-      border-radius: 8px;
-      padding: 11px 14px;
-      color: #eee;
-      font-size: 0.88rem;
-      font-family: monospace;
-      margin-bottom: 18px;
-      outline: none;
-    }
-    input:focus { border-color: #7eb3ff; }
-    button[type="submit"] {
+    .subtitle { font-size: 0.88rem; color: #777; margin-bottom: 28px; line-height: 1.6; }
+    .btn {
+      display: block;
       width: 100%;
       background: #003a8c;
       color: white;
       border: none;
       border-radius: 8px;
-      padding: 12px;
+      padding: 13px;
       font-size: 0.95rem;
       cursor: pointer;
       font-weight: 600;
+      text-align: center;
+      text-decoration: none;
     }
-    button[type="submit"]:hover { background: #0055cc; }
+    .btn:hover { background: #0055cc; }
+    .btn:disabled { background: #222; color: #555; cursor: default; }
     .alert { padding: 12px 16px; border-radius: 8px; font-size: 0.88rem; margin-bottom: 20px; line-height: 1.5; }
     .alert-error   { background: #3d0000; border-left: 4px solid #ff4d4d; color: #ff9999; }
     .alert-success { background: #002d00; border-left: 4px solid #4caf50; color: #88e888; }
+    .alert-info    { background: #001a33; border-left: 4px solid #7eb3ff; color: #9ecfff; }
+    .waiting-box { text-align: center; padding: 8px 0 20px; }
+    .spinner-ring {
+      display: inline-block;
+      width: 40px; height: 40px;
+      border: 4px solid #2a2a2a;
+      border-top-color: #7eb3ff;
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+      margin-bottom: 16px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .waiting-box p { font-size: 0.9rem; color: #aaa; line-height: 1.6; }
+    .waiting-box strong { color: #e8e8e8; }
+    .retry-link { display: block; text-align: center; margin-top: 16px; font-size: 0.82rem; color: #555; text-decoration: none; }
+    .retry-link:hover { color: #7eb3ff; }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="card">
-      {% if not success %}
-        <h1>Connect Your Canvas Account</h1>
-        <p class="subtitle">Generate a Canvas API token and paste it below. Your token stays in your browser session only.</p>
+<div class="container">
+  <div class="card">
 
-        <div class="steps">
-          <p>How to get your calendar feed URL:</p>
-          <ol>
-            <li>Go to your university's Canvas and log in</li>
-            <li>Click <strong>Calendar</strong> in the left sidebar</li>
-            <li>At the bottom-right of the page, click <strong>Calendar Feed</strong></li>
-            <li>Copy the full URL that appears</li>
-            <li>Paste it below</li>
-          </ol>
-        </div>
-
-        {% if error %}
-          <div class="alert alert-error">{{ error }}</div>
-        {% endif %}
-
-        <form method="POST" action="/setup">
-          <label for="feed_url">Canvas Calendar Feed URL</label>
-          <input type="text" id="feed_url" name="feed_url" required autofocus placeholder="https://howard.instructure.com/feeds/calendars/..."/>
-          <button type="submit">Connect Canvas</button>
-        </form>
-
-      {% else %}
-        <h1>You're connected!</h1>
-        <div class="alert alert-success">Canvas token saved. You're ready to go.</div>
-        <a href="/" style="display:block;text-align:center;background:#003a8c;color:white;padding:12px;border-radius:8px;text-decoration:none;font-weight:600;">
-          Go to Dashboard
-        </a>
-      {% endif %}
+    <div id="view-idle">
+      <div class="logo">📚</div>
+      <h1>Sign in to Canvas</h1>
+      <p class="subtitle">
+        Click below to open a browser window where you can sign in with your
+        Howard University Microsoft account — including 2FA — just like normal.
+        Once you're in, we'll handle the rest automatically.
+      </p>
+      <div id="error-box" style="display:none" class="alert alert-error"></div>
+      <button class="btn" onclick="startLogin()">Open Sign-In Window</button>
     </div>
+
+    <div id="view-waiting" style="display:none">
+      <div class="logo">🔐</div>
+      <h1>Complete sign-in</h1>
+      <div class="waiting-box">
+        <div class="spinner-ring"></div>
+        <p>
+          <strong>A browser window has opened.</strong><br>
+          Sign in with your Howard University account there,<br>
+          including any 2FA prompts. This page will update automatically.
+        </p>
+      </div>
+      <a class="retry-link" href="/setup">Cancel and start over</a>
+    </div>
+
+    <div id="view-success" style="display:none">
+      <div class="logo">✅</div>
+      <h1>You're connected!</h1>
+      <div class="alert alert-success">
+        Canvas account linked. Redirecting to your dashboard...
+      </div>
+    </div>
+
   </div>
+</div>
+
+<script>
+  async function startLogin() {
+    document.getElementById('error-box').style.display = 'none';
+    document.getElementById('view-idle').style.display = 'none';
+    document.getElementById('view-waiting').style.display = 'block';
+
+    // Tell the server to launch the browser
+    const res = await fetch('/setup/start', { method: 'POST' });
+    if (!res.ok) {
+      showError('Could not start the login process. Is the server running?');
+      return;
+    }
+
+    // Poll for result every 2 seconds
+    const interval = setInterval(async () => {
+      const r = await fetch('/setup/status');
+      const data = await r.json();
+
+      if (data.status === 'success') {
+        clearInterval(interval);
+        // Save token to session then go to dashboard
+        await fetch('/setup/complete', { method: 'POST' });
+        document.getElementById('view-waiting').style.display = 'none';
+        document.getElementById('view-success').style.display = 'block';
+        setTimeout(() => window.location.href = '/', 1500);
+      } else if (data.status === 'error') {
+        clearInterval(interval);
+        showError(data.message || 'Login failed. Please try again.');
+      }
+    }, 2000);
+  }
+
+  function showError(msg) {
+    document.getElementById('view-waiting').style.display = 'none';
+    document.getElementById('view-idle').style.display = 'block';
+    const box = document.getElementById('error-box');
+    box.textContent = msg;
+    box.style.display = 'block';
+  }
+</script>
 </body>
 </html>
 """
@@ -609,30 +649,32 @@ SETUP_HTML = """
 #  SETUP ROUTES
 # ─────────────────────────────────────────────
 
-@app.route("/setup", methods=["GET", "POST"])
+@app.route("/setup", methods=["GET"])
 def setup():
-    if request.method == "GET":
-        return render_template_string(SETUP_HTML, success=False, error=None)
+    return render_template_string(SETUP_HTML)
 
-    feed_url = request.form.get("feed_url", "").strip()
-    if not feed_url:
-        return render_template_string(SETUP_HTML, success=False, error="Please paste your Canvas calendar feed URL.")
-    if "feeds/calendars" not in feed_url:
-        return render_template_string(SETUP_HTML, success=False, error="That doesn't look like a Canvas calendar feed URL. Make sure you copied the full link.")
 
-    # Validate by fetching the feed
-    try:
-        import requests as req
-        resp = req.get(feed_url, timeout=10)
-        if resp.status_code != 200:
-            return render_template_string(SETUP_HTML, success=False, error="Could not fetch that feed URL — make sure you copied it correctly.")
-        if 'BEGIN:VCALENDAR' not in resp.text:
-            return render_template_string(SETUP_HTML, success=False, error="That URL doesn't appear to be a valid calendar feed.")
-    except Exception as e:
-        return render_template_string(SETUP_HTML, success=False, error=f"Could not reach Canvas: {e}")
+@app.route("/setup/start", methods=["POST"])
+def setup_start():
+    """Launch the visible browser in a background thread."""
+    start_browser_login()
+    return jsonify({"ok": True})
 
-    flask_session['canvas_feed_url'] = feed_url
-    return render_template_string(SETUP_HTML, success=True, error=None)
+
+@app.route("/setup/status")
+def setup_status():
+    """Return the current login status for the JS poller."""
+    return jsonify(get_login_result())
+
+
+@app.route("/setup/complete", methods=["POST"])
+def setup_complete():
+    """Read the token from the completed login and save it to the session."""
+    result = get_login_result()
+    if result.get("status") == "success" and result.get("token"):
+        flask_session["canvas_access_token"] = result["token"]
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "No token available"}), 400
 
 
 # ─────────────────────────────────────────────

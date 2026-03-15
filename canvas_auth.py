@@ -1,26 +1,35 @@
 """
 canvas_auth.py — Headless Microsoft SSO login for Howard Canvas.
 
-Handles the full login flow programmatically:
-  1. Navigate to Howard Canvas → redirects to Microsoft SSO
-  2. Fill in email + password
-  3. Detect 2FA type (Authenticator push or code entry)
-  4. If code: return prompt so the web UI can ask the user
-  5. If push: wait in background for the user to approve on their phone
-  6. After login: generate a Canvas API token and return it
+ALL Playwright operations run inside a single dedicated background thread.
+sync_playwright is tied to the greenlet/thread it was created in — calling
+page methods from a different thread raises "Cannot switch to a different
+thread". The fix: one thread owns the browser for its entire lifetime.
 
-Works headlessly — no visible browser needed, runs on Railway.
+Flow:
+  start_login()  → spawns _login_thread, blocks up to 60s for 2FA state
+  submit_code()  → sends code to the thread via queue, blocks for result
+  get_status()   → returns current state (polled by frontend for push flow)
 """
 
+import re
 import time
 import threading
+import queue
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 CANVAS_URL = "https://howard.instructure.com"
 
 _lock    = threading.Lock()
-_state   = {"status": "idle"}   # idle | pending | needs_code | needs_push | success | error
-_session = {}                    # holds playwright / browser / page between requests
+_state   = {"status": "idle"}
+
+# Queues for communicating between Flask request threads and the login thread.
+# _init_q  : login thread → start_login  (2FA state: needs_push / needs_code / error)
+# _code_q  : submit_code  → login thread (the OTP code string)
+# _final_q : login thread → submit_code  (result after code submission)
+_init_q  = queue.Queue(maxsize=1)
+_code_q  = queue.Queue(maxsize=1)
+_final_q = queue.Queue(maxsize=1)
 
 
 # ─────────────────────────────────────────────
@@ -29,18 +38,44 @@ _session = {}                    # holds playwright / browser / page between req
 
 def start_login(email: str, password: str) -> dict:
     """
-    Begin the SSO login flow synchronously up to the 2FA step.
-
-    Returns one of:
-      {'status': 'success',    'token': '...'}
-      {'status': 'needs_code', 'prompt': '...'}   ← app should ask user for code
-      {'status': 'needs_push', 'prompt': '...'}   ← app should tell user to check phone;
-                                                     poll get_status() until success/error
-      {'status': 'error',      'message': '...'}
+    Kick off the SSO login in a background thread.
+    Blocks until credential submission + 2FA detection completes (≤60s).
     """
-    _cleanup()
+    _flush_queues()
     _set(status="pending")
+    threading.Thread(target=_login_thread, args=(email, password), daemon=True).start()
+    try:
+        return _init_q.get(timeout=60)
+    except queue.Empty:
+        return _set(status="error", message="Login timed out. Please try again.")
 
+
+def submit_code(code: str) -> dict:
+    """
+    Send a 2FA code to the login thread and wait for the result (≤30s).
+    """
+    try:
+        _code_q.put_nowait(code)
+    except queue.Full:
+        return _set(status="error", message="No active login session. Please start over.")
+    try:
+        return _final_q.get(timeout=30)
+    except queue.Empty:
+        return _set(status="error", message="Timed out after code submission.")
+
+
+def get_status() -> dict:
+    """Return current auth state (polled by frontend during push flow)."""
+    with _lock:
+        return dict(_state)
+
+
+# ─────────────────────────────────────────────
+#  Login thread — owns the browser for its entire lifetime
+# ─────────────────────────────────────────────
+
+def _login_thread(email: str, password: str):
+    pw = browser = None
     try:
         pw      = sync_playwright().start()
         browser = pw.chromium.launch(
@@ -61,260 +96,208 @@ def start_login(email: str, password: str) -> dict:
             locale="en-US",
             timezone_id="America/New_York",
         )
-        # Hide the webdriver flag that Microsoft checks for
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         page = context.new_page()
 
-        with _lock:
-            _session["pw"]      = pw
-            _session["browser"] = browser
-            _session["page"]    = page
-
-        # Navigate to Canvas — it will redirect to Microsoft SSO automatically
+        # ── Navigate to Canvas (redirects to Microsoft SSO) ──────────────
         page.goto(CANVAS_URL, wait_until="load", timeout=30_000)
 
-        # If already on Canvas (cached session), finish immediately
         if _on_canvas(page):
-            return _finish(page)
+            _init_q.put(_finish(page))
+            return
 
-        # Wait for Microsoft email field
+        # ── Microsoft email step ──────────────────────────────────────────
         try:
             page.wait_for_selector('input[name="loginfmt"], input[type="email"]', timeout=15_000)
         except PlaywrightTimeout:
-            url = page.url
-            _cleanup()
-            return _set(status="error", message=f"Could not reach Microsoft login page. Landed on: {url}")
+            _init_q.put(_set(status="error", message=f"Could not reach Microsoft login. Landed on: {page.url}"))
+            return
 
-        # Fill email and click Next
         page.fill('input[name="loginfmt"]', email)
         page.click('#idSIButton9')
 
-        # Wait for password field
+        # ── Password step ─────────────────────────────────────────────────
         try:
             page.wait_for_selector('input[name="passwd"]', timeout=15_000)
         except PlaywrightTimeout:
-            url = page.url
-            _cleanup()
-            return _set(status="error", message=f"Email step failed or not recognised. Page: {url}")
+            _init_q.put(_set(status="error", message=f"Email step failed. Page: {page.url}"))
+            return
 
-        # Check for email-step error (e.g. account not found)
         if _has_error(page):
-            msg = _error_text(page)
-            _cleanup()
-            return _set(status="error", message=msg or f"Email not recognised. Page: {page.url}")
+            _init_q.put(_set(status="error", message=_error_text(page) or "Email not recognised."))
+            return
 
-        # Fill password and sign in
         page.fill('input[name="passwd"]', password)
         page.click('#idSIButton9')
         page.wait_for_load_state("load", timeout=15_000)
 
-        # Check for bad credentials
         if _has_error(page):
-            msg = _error_text(page)
-            _cleanup()
-            return _set(status="error", message=msg or f"Incorrect password. Page: {page.url}")
+            _init_q.put(_set(status="error", message=_error_text(page) or "Incorrect password."))
+            return
 
-        # Already on Canvas (no 2FA)?
         if _on_canvas(page):
-            return _finish(page)
+            _init_q.put(_finish(page))
+            return
 
-        # Detect 2FA type
+        # ── 2FA detection ─────────────────────────────────────────────────
         twofa = _detect_2fa(page)
 
-        if twofa == "code":
-            prompt = _get_2fa_prompt(page)
-            _set(status="needs_code", prompt=prompt)
-            return {"status": "needs_code", "prompt": prompt}
-
+        # ── Push / number-matching ────────────────────────────────────────
         if twofa == "push":
             prompt = _get_2fa_prompt(page)
             number = _get_display_number(page)
-            _set(status="needs_push", prompt=prompt, number=number)
-            # Wait for phone approval in background
-            t = threading.Thread(target=_wait_for_push, daemon=True)
-            t.start()
-            return {"status": "needs_push", "prompt": prompt, "number": number}
+            _init_q.put(_set(status="needs_push", prompt=prompt, number=number))
+            # Wait for approval in THIS thread (no cross-thread Playwright calls)
+            _wait_for_push(page)
+            return
 
-        # "Stay signed in?" prompt — click No and proceed
+        # ── Code entry ────────────────────────────────────────────────────
+        if twofa == "code":
+            prompt = _get_2fa_prompt(page)
+            _init_q.put(_set(status="needs_code", prompt=prompt))
+
+            # Wait for submit_code() to provide the code
+            try:
+                code = _code_q.get(timeout=120)
+            except queue.Empty:
+                _final_q.put(_set(status="error", message="Timed out waiting for code."))
+                return
+
+            # Fill the code input
+            filled = False
+            for sel in ['input[name="otc"]', 'input[name="code"]', 'input[autocomplete="one-time-code"]']:
+                try:
+                    page.wait_for_selector(sel, timeout=5_000)
+                    page.fill(sel, code)
+                    filled = True
+                    break
+                except PlaywrightTimeout:
+                    continue
+
+            if not filled:
+                _final_q.put(_set(status="error", message="Could not find the code input. Please try again."))
+                return
+
+            page.locator('#idSubmit_SAOTCC_Continue, #idSIButton9, input[type="submit"]').first.click()
+            page.wait_for_load_state("load", timeout=20_000)
+
+            if _has_error(page):
+                _final_q.put(_set(status="error", message=_error_text(page) or "Invalid code."))
+                return
+
+            if _has_stay_signed_in(page):
+                page.locator('#idBtn_Back, button:has-text("No"), input[value="No"]').first.click()
+                page.wait_for_load_state("load", timeout=10_000)
+
+            if not _on_canvas(page):
+                try:
+                    page.wait_for_url(f"*{CANVAS_URL}*", timeout=15_000)
+                except PlaywrightTimeout:
+                    page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
+
+            _final_q.put(_finish(page))
+            return
+
+        # ── "Stay signed in?" with no 2FA ────────────────────────────────
         if _has_stay_signed_in(page):
-            _click(page, '#idBtn_Back, input[value="No"]')
+            page.locator('#idBtn_Back, input[value="No"]').first.click()
             page.wait_for_load_state("load", timeout=10_000)
             if _on_canvas(page):
-                return _finish(page)
+                _init_q.put(_finish(page))
+                return
 
-        _cleanup()
-        return _set(status="error",
-                    message=f"Unexpected page after login: {page.url}. "
-                            "Howard may have changed their SSO flow.")
+        _init_q.put(_set(status="error",
+                         message=f"Unexpected page after login: {page.url}"))
 
     except PlaywrightTimeout:
-        _cleanup()
-        return _set(status="error", message="Login timed out. Check your credentials and try again.")
+        result = _set(status="error", message="Login timed out. Check your credentials and try again.")
+        _safe_put(_init_q, result)
+        _safe_put(_final_q, result)
     except Exception as e:
-        _cleanup()
-        return _set(status="error", message=str(e))
-
-
-def submit_code(code: str) -> dict:
-    """
-    Submit a 2FA verification code (TOTP / SMS).
-
-    Returns one of:
-      {'status': 'success', 'token': '...'}
-      {'status': 'error',   'message': '...'}
-    """
-    with _lock:
-        page = _session.get("page")
-
-    if not page:
-        return _set(status="error", message="No active login session. Please start over.")
-
-    try:
-        # Find and fill whichever OTC input is actually present
-        code_selectors = [
-            'input[name="otc"]',
-            'input[name="code"]',
-            'input[autocomplete="one-time-code"]',
-        ]
-        filled = False
-        for sel in code_selectors:
-            try:
-                page.wait_for_selector(sel, timeout=5_000)
-                page.fill(sel, code)
-                filled = True
-                break
-            except PlaywrightTimeout:
-                continue
-        if not filled:
-            return _set(status="error", message="Could not find the verification code input. Please try again.")
-
-        _click(page, '#idSubmit_SAOTCC_Continue, #idSIButton9, input[type="submit"]')
-
-        # Wait for the page to move on — use load (not networkidle) since Microsoft
-        # auth pages have continuous background network activity that blocks networkidle.
-        page.wait_for_load_state("load", timeout=20_000)
-
-        if _has_error(page):
-            return _set(status="error", message=_error_text(page) or "Invalid code. Please try again.")
-
-        if _has_stay_signed_in(page):
-            _click(page, '#idBtn_Back, input[value="No"]')
-            page.wait_for_load_state("load", timeout=10_000)
-
-        if _on_canvas(page):
-            return _finish(page)
-
-        # Give the page a moment to fully redirect to Canvas
+        result = _set(status="error", message=str(e))
+        _safe_put(_init_q, result)
+        _safe_put(_final_q, result)
+    finally:
         try:
-            page.wait_for_url(f"{CANVAS_URL}/**", timeout=10_000)
-            if _on_canvas(page):
-                return _finish(page)
-        except PlaywrightTimeout:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            pw.stop()
+        except Exception:
             pass
 
-        return _set(status="error", message="Code accepted but could not reach Canvas.")
 
-    except PlaywrightTimeout:
-        _cleanup()
-        return _set(status="error", message="Timed out after code submission.")
-    except Exception as e:
-        _cleanup()
-        return _set(status="error", message=str(e))
+def _wait_for_push(page):
+    """
+    Wait for Authenticator approval — runs INSIDE the login thread.
+    All page calls are safe here because we own the Playwright instance.
+    """
+    start_url = page.url
+    print(f"[push] waiting, start: {start_url}", flush=True)
 
+    for _ in range(150):  # up to 5 minutes
+        time.sleep(2)
+        try:
+            url = page.url
+            print(f"[push] url: {url}", flush=True)
 
-def get_status() -> dict:
-    """Return the current auth state (for polling)."""
-    with _lock:
-        return dict(_state)
+            # On Canvas — done
+            if CANVAS_URL in url:
+                print("[push] on canvas", flush=True)
+                _finish(page)
+                return
 
+            # "Stay signed in?" — dismiss and let Microsoft redirect
+            if _has_stay_signed_in(page):
+                print("[push] dismissing stay-signed-in", flush=True)
+                page.locator('#idBtn_Back, button:has-text("No"), input[value="No"]').first.click()
+                continue
 
-# ─────────────────────────────────────────────
-#  Internal helpers
-# ─────────────────────────────────────────────
-
-def _wait_for_push():
-    """Background thread: poll until Microsoft push is approved or times out."""
-    with _lock:
-        page = _session.get("page")
-    if not page:
-        return
-
-    try:
-        start_url = page.url
-        print(f"[push] waiting for approval, start url: {start_url}", flush=True)
-
-        for _ in range(150):  # 5 minutes
-            time.sleep(2)
-            try:
-                url = page.url
-                print(f"[push] url: {url}", flush=True)
-
-                # Success — on Canvas
-                if CANVAS_URL in url:
-                    print("[push] on canvas, finishing", flush=True)
+            # Navigated to a different Microsoft page (post-approval intermediate)
+            if url != start_url and _is_microsoft(url):
+                print("[push] intermediate microsoft page, going to canvas", flush=True)
+                try:
+                    page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
+                except PlaywrightTimeout:
+                    pass
+                if _on_canvas(page):
                     _finish(page)
-                    return
+                return
 
-                # "Stay signed in?" — check regardless of URL (Microsoft is a SPA,
-                # this can appear without a URL change)
-                if _has_stay_signed_in(page):
-                    print("[push] dismissing stay-signed-in", flush=True)
-                    page.locator('#idBtn_Back, button:has-text("No"), input[value="No"]').first.click()
-                    continue
+            # URL unchanged but number element gone → SPA approved
+            gone = page.locator('#idRichContext_DisplaySign, #displaySign, .displaySign').count() == 0
+            if gone:
+                print("[push] number element gone, going to canvas", flush=True)
+                try:
+                    page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
+                except PlaywrightTimeout:
+                    pass
+                if _on_canvas(page):
+                    _finish(page)
+                return
 
-                # URL changed to a different Microsoft page
-                if url != start_url and _is_microsoft_page(url):
-                    print(f"[push] new microsoft page, navigating to canvas", flush=True)
-                    try:
-                        page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
-                    except PlaywrightTimeout:
-                        pass
-                    if _on_canvas(page):
-                        _finish(page)
-                        return
-                    continue
+        except Exception as e:
+            print(f"[push] exception: {e}", flush=True)
+            err = str(e).lower()
+            if any(k in err for k in ["closed", "target", "destroyed"]):
+                _set(status="error", message="Browser session lost. Please try again.")
+                return
 
-                # URL unchanged — check if the number matching element has disappeared,
-                # which means approval was processed (SPA state change without URL change)
-                number_el = page.locator(
-                    '#idRichContext_DisplaySign, #displaySign, .displaySign'
-                )
-                if number_el.count() == 0:
-                    print("[push] number element gone, navigating to canvas", flush=True)
-                    try:
-                        page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
-                    except PlaywrightTimeout:
-                        pass
-                    if _on_canvas(page):
-                        _finish(page)
-                        return
+    _set(status="error", message="Push notification timed out. Please try again.")
 
-            except PlaywrightTimeout:
-                pass
-            except Exception as e:
-                err = str(e).lower()
-                print(f"[push] exception: {e}", flush=True)
-                if any(k in err for k in ["closed", "target", "destroyed"]):
-                    _set(status="error", message="Browser session lost. Please try again.")
-                    return
 
-        _set(status="error", message="Push notification timed out. Please try again.")
-    except Exception as e:
-        _set(status="error", message=str(e))
-    finally:
-        _cleanup()
-
+# ─────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────
 
 def _finish(page) -> dict:
-    """Generate a Canvas API token and return success."""
     token = _generate_api_token(page)
-    _cleanup()
     if token:
         return _set(status="success", token=token)
-    return _set(status="error",
-                message="Logged in but could not generate a Canvas API token.")
+    return _set(status="error", message="Logged in but could not generate a Canvas API token.")
 
 
 def _generate_api_token(page) -> str | None:
@@ -356,17 +339,45 @@ def _generate_api_token(page) -> str | None:
         return None
 
 
+def _detect_2fa(page) -> str | None:
+    number_match_sel = (
+        '#idRichContext_DisplaySign, #displaySign, .displaySign, '
+        '[data-bind*="DisplaySign"], #idDiv_SAOTCC_DisplaySign'
+    )
+    code_input_sel = 'input[name="otc"], input[name="code"], input[autocomplete="one-time-code"]'
+
+    try:
+        page.wait_for_selector(f'{number_match_sel}, {code_input_sel}', timeout=10_000)
+    except PlaywrightTimeout:
+        pass
+
+    for sel in number_match_sel.split(', '):
+        try:
+            if page.locator(sel.strip()).count() > 0:
+                return "push"
+        except Exception:
+            pass
+
+    for sel in code_input_sel.split(', '):
+        try:
+            el = page.locator(sel.strip()).first
+            if el.count() > 0 and el.is_visible():
+                return "code"
+        except Exception:
+            pass
+
+    html = page.content().lower()
+    if any(k in html for k in ["enter the number shown", "number shown", "approve sign in",
+                                "open your authenticator", "push notification", "number matching"]):
+        return "push"
+    if any(k in html for k in ["verification code", "enter the code", "one-time", "otc"]):
+        return "code"
+    return None
+
+
 def _get_display_number(page) -> str | None:
-    """Extract the number matching digit Microsoft shows on the push screen."""
-    selectors = [
-        '#idRichContext_DisplaySign',
-        '#displaySign',
-        '.displaySign',
-        '[data-bind*="DisplaySign"]',
-        '#idDiv_SAOTCC_DisplaySign',
-    ]
-    # Wait for any of the number elements to appear (Microsoft renders it async)
-    for sel in selectors:
+    for sel in ['#idRichContext_DisplaySign', '#displaySign', '.displaySign',
+                '[data-bind*="DisplaySign"]', '#idDiv_SAOTCC_DisplaySign']:
         try:
             page.wait_for_selector(sel, timeout=5_000)
             el = page.locator(sel).first
@@ -380,60 +391,12 @@ def _get_display_number(page) -> str | None:
         except Exception:
             continue
 
-    # Fallback: scan page HTML for a standalone 2-digit number
-    import re
     try:
-        html = page.content()
-        match = re.search(r'(?<!\d)(\d{2})(?!\d)', html)
+        match = re.search(r'(?<!\d)(\d{2})(?!\d)', page.content())
         if match:
             return match.group(1)
     except Exception:
         pass
-
-    return None
-
-
-def _detect_2fa(page) -> str | None:
-    """Return 'code', 'push', or None. Waits for the 2FA UI to actually render."""
-    number_match_sel = (
-        '#idRichContext_DisplaySign, #displaySign, .displaySign, '
-        '[data-bind*="DisplaySign"], #idDiv_SAOTCC_DisplaySign'
-    )
-    code_input_sel = (
-        'input[name="otc"], input[name="code"], input[autocomplete="one-time-code"]'
-    )
-
-    # Wait up to 10s for whichever 2FA element appears first
-    try:
-        page.wait_for_selector(f'{number_match_sel}, {code_input_sel}', timeout=10_000)
-    except PlaywrightTimeout:
-        pass
-
-    # Number matching element present → push (must check before code input
-    # because Microsoft's number matching page can also have hidden code inputs)
-    for sel in number_match_sel.split(', '):
-        try:
-            if page.locator(sel.strip()).count() > 0:
-                return "push"
-        except Exception:
-            pass
-
-    # Visible code input → code entry
-    for sel in code_input_sel.split(', '):
-        try:
-            el = page.locator(sel.strip()).first
-            if el.count() > 0 and el.is_visible():
-                return "code"
-        except Exception:
-            pass
-
-    # Text fallback
-    html = page.content().lower()
-    if any(k in html for k in ["enter the number shown", "number shown", "approve sign in",
-                                "open your authenticator", "push notification", "number matching"]):
-        return "push"
-    if any(k in html for k in ["verification code", "enter the code", "one-time", "otc"]):
-        return "code"
     return None
 
 
@@ -472,7 +435,7 @@ def _on_canvas(page) -> bool:
         return False
 
 
-def _is_microsoft_page(url: str) -> bool:
+def _is_microsoft(url: str) -> bool:
     return any(d in url for d in ["microsoftonline.com", "microsoft.com", "live.com", "login.windows.net"])
 
 
@@ -483,15 +446,6 @@ def _has_stay_signed_in(page) -> bool:
         return False
 
 
-def _wait_and_fill(page, selector: str, value: str):
-    page.wait_for_selector(selector, timeout=10_000)
-    page.fill(selector.split(",")[0].strip(), value)
-
-
-def _click(page, selector: str):
-    page.locator(selector).first.click()
-
-
 def _set(**kwargs) -> dict:
     with _lock:
         _state.clear()
@@ -499,17 +453,19 @@ def _set(**kwargs) -> dict:
     return dict(kwargs)
 
 
-def _cleanup():
-    with _lock:
-        pw      = _session.pop("pw", None)
-        browser = _session.pop("browser", None)
-        _session.pop("context", None)
-        _session.pop("page", None)
+def _safe_put(q: queue.Queue, item):
+    """Put item into queue without blocking (drop if full)."""
     try:
-        browser.close()
-    except Exception:
+        q.put_nowait(item)
+    except queue.Full:
         pass
-    try:
-        pw.stop()
-    except Exception:
-        pass
+
+
+def _flush_queues():
+    """Drain all queues before starting a new login."""
+    for q in (_init_q, _code_q, _final_q):
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break

@@ -1,8 +1,8 @@
 """
 canvas.py — Fetches upcoming assignments from the Canvas REST API.
 
-Works both locally and on Railway. No MCP dependency — calls
-https://howard.instructure.com/api/v1/calendar_events directly.
+Works both locally and on Railway. No MCP dependency — calls the Canvas
+REST API directly. Supports any Canvas school via canvas_url parameter.
 """
 
 import os
@@ -14,12 +14,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-CANVAS_BASE = "https://howard.instructure.com"
 DAYS_AHEAD  = int(os.getenv("DAYS_AHEAD", 14))
 DISPLAY_TZ  = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
 
+_DEFAULT_CANVAS_URL = "https://howard.instructure.com"
 
-def get_upcoming_assignments(access_token: str = None, cookies: dict = None) -> list[dict]:
+
+def _resolve_canvas_url(canvas_url: str = None) -> str:
+    """Return canvas_url if provided, else fall back to env var or default."""
+    return canvas_url or os.getenv("CANVAS_URL", _DEFAULT_CANVAS_URL)
+
+
+def get_upcoming_assignments(access_token: str = None, cookies: dict = None, canvas_url: str = None) -> list[dict]:
     """
     Return assignments due in the next DAYS_AHEAD days.
 
@@ -30,6 +36,8 @@ def get_upcoming_assignments(access_token: str = None, cookies: dict = None) -> 
     if not token and not cookies:
         raise ValueError("No Canvas credentials. Please log in.")
 
+    base = _resolve_canvas_url(canvas_url)
+
     now       = datetime.now(timezone.utc)
     end       = now + timedelta(days=DAYS_AHEAD)
     now_local = now.astimezone(DISPLAY_TZ)
@@ -38,7 +46,7 @@ def get_upcoming_assignments(access_token: str = None, cookies: dict = None) -> 
         p = dict(params or {})
         if token:
             p["access_token"] = token
-        resp = requests.get(f"{CANVAS_BASE}{path}", params=p,
+        resp = requests.get(f"{base}{path}", params=p,
                             cookies=cookies or {}, timeout=15)
         resp.raise_for_status()
         return resp.json()
@@ -96,7 +104,7 @@ def get_upcoming_assignments(access_token: str = None, cookies: dict = None) -> 
     return assignments
 
 
-def get_grades(access_token: str = None, cookies: dict = None) -> list[dict]:
+def get_grades(access_token: str = None, cookies: dict = None, canvas_url: str = None) -> list[dict]:
     """
     Return current grades for all active courses.
 
@@ -105,6 +113,8 @@ def get_grades(access_token: str = None, cookies: dict = None) -> list[dict]:
     token = access_token or os.getenv("CANVAS_ACCESS_TOKEN")
     if not token and not cookies:
         raise ValueError("No Canvas credentials. Please log in.")
+
+    base = _resolve_canvas_url(canvas_url)
 
     params = {
         "enrollment_state": "active",
@@ -115,7 +125,7 @@ def get_grades(access_token: str = None, cookies: dict = None) -> list[dict]:
         params["access_token"] = token
 
     resp = requests.get(
-        f"{CANVAS_BASE}/api/v1/courses",
+        f"{base}/api/v1/courses",
         params=params,
         cookies=cookies or {},
         timeout=15,
@@ -141,7 +151,7 @@ def get_grades(access_token: str = None, cookies: dict = None) -> list[dict]:
             "course":  course.get("name") or course.get("course_code") or "Unknown Course",
             "score":   score,   # numeric e.g. 92.5
             "grade":   grade,   # letter  e.g. "A"
-            "url":     f"{CANVAS_BASE}/courses/{course['id']}",
+            "url":     f"{base}/courses/{course['id']}",
         })
 
     grades.sort(key=lambda x: x["course"])

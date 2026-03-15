@@ -40,6 +40,9 @@ def get_canvas_cookies():
     """Return Canvas session cookies stored after SSO login."""
     return flask_session.get('canvas_cookies') or None
 
+def get_canvas_url():
+    """Return the Canvas base URL from the session, falling back to env var or default."""
+    return flask_session.get('canvas_url') or os.getenv('CANVAS_URL', 'https://howard.instructure.com')
 
 def get_phone():
     """Return the user's phone number from the session, falling back to .env."""
@@ -52,7 +55,9 @@ def require_auth():
     exempt = ('/setup', '/sms', '/health')
     if any(request.path.startswith(e) for e in exempt):
         return
-    if not get_access_token() and not get_canvas_cookies():
+    has_creds = get_access_token() or get_canvas_cookies()
+    has_url   = flask_session.get('canvas_url') or os.getenv('CANVAS_URL')
+    if not has_creds or not has_url:
         return redirect(url_for('setup'))
     if not get_phone() and request.path != '/setup/phone':
         return redirect(url_for('setup_phone'))
@@ -488,7 +493,7 @@ def dashboard():
 @app.route("/api/assignments")
 def api_assignments():
     try:
-        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies(), canvas_url=get_canvas_url())
         for a in assignments:
             a["due"] = a["due"].isoformat()
         return jsonify({"assignments": assignments})
@@ -499,7 +504,7 @@ def api_assignments():
 @app.route("/api/summary")
 def api_summary():
     try:
-        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies(), canvas_url=get_canvas_url())
         summary = summarize_assignments(assignments)
         return jsonify({"summary": summary})
     except Exception as e:
@@ -509,7 +514,7 @@ def api_summary():
 @app.route("/api/schedule")
 def api_schedule():
     try:
-        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies(), canvas_url=get_canvas_url())
         schedule = generate_study_schedule(assignments)
         return jsonify(schedule)
     except Exception as e:
@@ -519,7 +524,7 @@ def api_schedule():
 @app.route("/api/grades")
 def api_grades():
     try:
-        grades = get_grades(access_token=get_access_token(), cookies=get_canvas_cookies())
+        grades = get_grades(access_token=get_access_token(), cookies=get_canvas_cookies(), canvas_url=get_canvas_url())
         return jsonify({"grades": grades})
     except Exception as e:
         return jsonify({"grades": [], "error": str(e)}), 500
@@ -530,7 +535,7 @@ def api_ask():
     try:
         data        = request.get_json()
         question    = data.get("question", "")
-        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies(), canvas_url=get_canvas_url())
         answer      = answer_question(question, assignments)
         return jsonify({"answer": answer})
     except Exception as e:
@@ -540,7 +545,7 @@ def api_ask():
 @app.route("/api/send-digest", methods=["POST"])
 def api_send_digest():
     try:
-        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies(), canvas_url=get_canvas_url())
         summary     = summarize_assignments(assignments)
         send_sms(summary, to=get_phone())
         return jsonify({"ok": True})
@@ -633,16 +638,18 @@ SETUP_HTML = """
 <div class="container">
   <div class="card">
 
-    <!-- Step 1: Email + Password -->
+    <!-- Step 1: Canvas URL + Email + Password -->
     <div id="view-login">
       <div class="logo">📚</div>
       <h1>Sign in to Canvas</h1>
-      <p class="subtitle">Enter your Howard University Microsoft account credentials.</p>
+      <p class="subtitle">Enter your school's Canvas URL and login credentials.</p>
       <div id="error-box" style="display:none" class="alert alert-error"></div>
-      <label>Howard Email</label>
-      <input type="email" id="email" placeholder="you@howard.edu" autocomplete="email"/>
+      <label>Canvas URL</label>
+      <input type="text" id="canvas-url" placeholder="https://yourschool.instructure.com" autocomplete="url"/>
+      <label>Email</label>
+      <input type="email" id="email" placeholder="you@yourschool.edu" autocomplete="email"/>
       <label>Password</label>
-      <input type="password" id="password" placeholder="Your Microsoft password" autocomplete="current-password"/>
+      <input type="password" id="password" placeholder="Your password" autocomplete="current-password"/>
       <button class="btn" id="login-btn" onclick="submitLogin()">Sign In</button>
     </div>
 
@@ -700,8 +707,10 @@ SETUP_HTML = """
   }
 
   async function submitLogin() {
-    const email    = document.getElementById('email').value.trim();
-    const password = document.getElementById('password').value;
+    const canvasUrl = document.getElementById('canvas-url').value.trim();
+    const email     = document.getElementById('email').value.trim();
+    const password  = document.getElementById('password').value;
+    if (!canvasUrl) { setError('error-box', 'Please enter your Canvas URL (e.g. https://yourschool.instructure.com).'); return; }
     if (!email || !password) { setError('error-box', 'Please enter your email and password.'); return; }
 
     const btn = document.getElementById('login-btn');
@@ -712,7 +721,7 @@ SETUP_HTML = """
     const res  = await fetch('/setup/login', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ email, password })
+      body: JSON.stringify({ canvas_url: canvasUrl, email, password })
     });
     const data = await res.json();
 
@@ -789,15 +798,20 @@ def setup():
 
 @app.route("/setup/login", methods=["POST"])
 def setup_login():
-    """Step 1 — submit email + password, kick off SSO."""
+    """Step 1 — submit canvas_url + email + password, kick off login."""
     if not BROWSER_AUTH:
         return jsonify({"status": "error", "message": "Auth not available. Set CANVAS_ACCESS_TOKEN env var."}), 400
-    data     = request.get_json()
-    email    = (data.get("email") or "").strip()
-    password = data.get("password") or ""
+    data       = request.get_json()
+    canvas_url = (data.get("canvas_url") or "").strip().rstrip("/")
+    email      = (data.get("email") or "").strip()
+    password   = data.get("password") or ""
+    if not canvas_url:
+        return jsonify({"status": "error", "message": "Canvas URL is required."})
     if not email or not password:
         return jsonify({"status": "error", "message": "Email and password are required."})
-    result = start_login(email, password)
+    # Stash canvas_url in session so /setup/complete can persist it
+    flask_session["canvas_url"] = canvas_url
+    result = start_login(email, password, canvas_url)
     return jsonify(result)
 
 

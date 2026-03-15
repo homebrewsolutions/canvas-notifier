@@ -1,5 +1,5 @@
 """
-canvas_auth.py — Headless Microsoft SSO login for Howard Canvas.
+canvas_auth.py — Headless Canvas login supporting Microsoft SSO and plain Canvas login.
 
 ALL Playwright operations run inside a single dedicated background thread.
 sync_playwright is tied to the greenlet/thread it was created in — calling
@@ -18,8 +18,6 @@ import threading
 import queue
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-CANVAS_URL = "https://howard.instructure.com"
-
 _lock    = threading.Lock()
 _state   = {"status": "idle"}
 
@@ -36,14 +34,14 @@ _final_q = queue.Queue(maxsize=1)
 #  Public API
 # ─────────────────────────────────────────────
 
-def start_login(email: str, password: str) -> dict:
+def start_login(email: str, password: str, canvas_url: str = "https://howard.instructure.com") -> dict:
     """
     Kick off the SSO login in a background thread.
     Blocks until credential submission + 2FA detection completes (≤60s).
     """
     _flush_queues()
     _set(status="pending")
-    threading.Thread(target=_login_thread, args=(email, password), daemon=True).start()
+    threading.Thread(target=_login_thread, args=(email, password, canvas_url), daemon=True).start()
     try:
         return _init_q.get(timeout=60)
     except queue.Empty:
@@ -74,7 +72,7 @@ def get_status() -> dict:
 #  Login thread — owns the browser for its entire lifetime
 # ─────────────────────────────────────────────
 
-def _login_thread(email: str, password: str):
+def _login_thread(email: str, password: str, canvas_url: str = "https://howard.instructure.com"):
     pw = browser = None
     try:
         pw      = sync_playwright().start()
@@ -101,12 +99,54 @@ def _login_thread(email: str, password: str):
         )
         page = context.new_page()
 
-        # ── Navigate to Canvas (redirects to Microsoft SSO) ──────────────
-        page.goto(CANVAS_URL, wait_until="load", timeout=30_000)
+        # ── Navigate to Canvas ────────────────────────────────────────────
+        page.goto(canvas_url, wait_until="load", timeout=30_000)
 
-        if _on_canvas(page):
-            _init_q.put(_finish(page))
+        if _on_canvas(page, canvas_url):
+            _init_q.put(_finish(page, canvas_url))
             return
+
+        # ── Detect login type: plain Canvas or Microsoft SSO ─────────────
+        is_plain_canvas = _is_plain_canvas_login(page)
+        is_microsoft    = _is_microsoft(page.url)
+
+        if is_plain_canvas:
+            # ── Plain Canvas login (username/password form) ───────────────
+            try:
+                page.wait_for_selector('#pseudonym_session_unique_id', timeout=10_000)
+            except PlaywrightTimeout:
+                _init_q.put(_set(status="error", message=f"Could not find Canvas login form. Landed on: {page.url}"))
+                return
+
+            page.fill('#pseudonym_session_unique_id', email)
+            page.fill('#pseudonym_session_password', password)
+            page.locator('button[type="submit"], input[type="submit"]').first.click()
+            page.wait_for_load_state("load", timeout=15_000)
+
+            if _on_canvas(page, canvas_url) and "/login" not in page.url:
+                _init_q.put(_finish(page, canvas_url))
+                return
+
+            # Check for login error
+            if _has_canvas_login_error(page):
+                _init_q.put(_set(status="error", message=_canvas_login_error_text(page) or "Incorrect username or password."))
+                return
+
+            if _on_canvas(page, canvas_url):
+                _init_q.put(_finish(page, canvas_url))
+                return
+
+            _init_q.put(_set(status="error", message=f"Login failed. Landed on: {page.url}"))
+            return
+
+        # ── Microsoft SSO flow ────────────────────────────────────────────
+        if not is_microsoft:
+            # Try waiting for Microsoft login page
+            try:
+                page.wait_for_selector('input[name="loginfmt"], input[type="email"]', timeout=15_000)
+            except PlaywrightTimeout:
+                _init_q.put(_set(status="error", message=f"Could not reach login page. Landed on: {page.url}"))
+                return
 
         # ── Microsoft email step ──────────────────────────────────────────
         try:
@@ -137,8 +177,8 @@ def _login_thread(email: str, password: str):
             _init_q.put(_set(status="error", message=_error_text(page) or "Incorrect password."))
             return
 
-        if _on_canvas(page):
-            _init_q.put(_finish(page))
+        if _on_canvas(page, canvas_url):
+            _init_q.put(_finish(page, canvas_url))
             return
 
         # ── 2FA detection ─────────────────────────────────────────────────
@@ -153,7 +193,7 @@ def _login_thread(email: str, password: str):
             number = _get_display_number(page)
             _init_q.put(_set(status="needs_push", prompt=prompt, number=number))
             # Wait for approval in THIS thread (no cross-thread Playwright calls)
-            _wait_for_push(page)
+            _wait_for_push(page, canvas_url)
             return
 
         # ── Code entry ────────────────────────────────────────────────────
@@ -194,21 +234,21 @@ def _login_thread(email: str, password: str):
                 page.locator('#idBtn_Back, button:has-text("No"), input[value="No"]').first.click()
                 page.wait_for_load_state("load", timeout=10_000)
 
-            if not _on_canvas(page):
+            if not _on_canvas(page, canvas_url):
                 try:
-                    page.wait_for_url(f"*{CANVAS_URL}*", timeout=15_000)
+                    page.wait_for_url(f"*{canvas_url}*", timeout=15_000)
                 except PlaywrightTimeout:
-                    page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
+                    page.goto(canvas_url, wait_until="load", timeout=20_000)
 
-            _final_q.put(_finish(page))
+            _final_q.put(_finish(page, canvas_url))
             return
 
         # ── "Stay signed in?" with no 2FA ────────────────────────────────
         if _has_stay_signed_in(page):
             page.locator('#idBtn_Back, input[value="No"]').first.click()
             page.wait_for_load_state("load", timeout=10_000)
-            if _on_canvas(page):
-                _init_q.put(_finish(page))
+            if _on_canvas(page, canvas_url):
+                _init_q.put(_finish(page, canvas_url))
                 return
 
         _init_q.put(_set(status="error",
@@ -233,7 +273,7 @@ def _login_thread(email: str, password: str):
             pass
 
 
-def _wait_for_push(page):
+def _wait_for_push(page, canvas_url: str = "https://howard.instructure.com"):
     """
     Wait for Authenticator approval — runs INSIDE the login thread.
     All page calls are safe here because we own the Playwright instance.
@@ -248,9 +288,9 @@ def _wait_for_push(page):
             print(f"[push] url: {url}", flush=True)
 
             # On Canvas — done
-            if CANVAS_URL in url:
+            if canvas_url in url:
                 print("[push] on canvas", flush=True)
-                _finish(page)
+                _finish(page, canvas_url)
                 return
 
             # "Stay signed in?" — dismiss and let Microsoft redirect
@@ -263,11 +303,11 @@ def _wait_for_push(page):
             if url != start_url and _is_microsoft(url):
                 print("[push] intermediate microsoft page, going to canvas", flush=True)
                 try:
-                    page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
+                    page.goto(canvas_url, wait_until="load", timeout=20_000)
                 except PlaywrightTimeout:
                     pass
-                if _on_canvas(page):
-                    _finish(page)
+                if _on_canvas(page, canvas_url):
+                    _finish(page, canvas_url)
                 return
 
             # URL unchanged but number element gone → approval processed
@@ -284,10 +324,10 @@ def _wait_for_push(page):
 
                 print("[push] navigating to canvas", flush=True)
                 try:
-                    page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
+                    page.goto(canvas_url, wait_until="load", timeout=20_000)
                 except PlaywrightTimeout:
                     pass
-                _finish(page)
+                _finish(page, canvas_url)
                 return
 
         except Exception as e:
@@ -304,22 +344,23 @@ def _wait_for_push(page):
 #  Helpers
 # ─────────────────────────────────────────────
 
-def _finish(page) -> dict:
-    cookies = _extract_cookies(page)
+def _finish(page, canvas_url: str = "https://howard.instructure.com") -> dict:
+    cookies = _extract_cookies(page, canvas_url)
     if cookies:
         return _set(status="success", cookies=cookies)
     return _set(status="error", message="Logged in but could not extract Canvas session cookies.")
 
 
-def _extract_cookies(page) -> dict | None:
+def _extract_cookies(page, canvas_url: str = "https://howard.instructure.com") -> dict | None:
     """Extract Canvas session cookies from the logged-in browser."""
     try:
         # Make sure we're on Canvas first
-        if CANVAS_URL not in page.url:
-            page.goto(CANVAS_URL, wait_until="load", timeout=15_000)
+        if canvas_url not in page.url:
+            page.goto(canvas_url, wait_until="load", timeout=15_000)
 
+        canvas_host = canvas_url.split("//")[1]
         cookies = page.context.cookies()
-        cookie_dict = {c["name"]: c["value"] for c in cookies if CANVAS_URL.split("//")[1] in c.get("domain", "")}
+        cookie_dict = {c["name"]: c["value"] for c in cookies if canvas_host in c.get("domain", "")}
         print(f"[cookies] extracted {len(cookie_dict)} canvas cookies", flush=True)
 
         if cookie_dict:
@@ -432,15 +473,43 @@ def _error_text(page) -> str:
         return ""
 
 
-def _on_canvas(page) -> bool:
+def _on_canvas(page, canvas_url: str = "https://howard.instructure.com") -> bool:
     try:
-        return CANVAS_URL in page.url
+        return canvas_url in page.url
     except Exception:
         return False
 
 
 def _is_microsoft(url: str) -> bool:
     return any(d in url for d in ["microsoftonline.com", "microsoft.com", "live.com", "login.windows.net"])
+
+
+def _is_plain_canvas_login(page) -> bool:
+    """Return True if the page looks like a native Canvas login form."""
+    try:
+        url = page.url
+        if "/login/canvas" in url or "/login/ldap" in url:
+            return True
+        if page.locator('#pseudonym_session_unique_id').count() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _has_canvas_login_error(page) -> bool:
+    try:
+        err = page.locator('#flash_message_holder .ic-flash-error, .ic-flash-error, #login_error_box, .alert.alert-error').first
+        return err.count() > 0 and bool((err.text_content() or "").strip())
+    except Exception:
+        return False
+
+
+def _canvas_login_error_text(page) -> str:
+    try:
+        return page.locator('#flash_message_holder .ic-flash-error, .ic-flash-error, #login_error_box, .alert.alert-error').first.text_content().strip()
+    except Exception:
+        return ""
 
 
 def _has_stay_signed_in(page) -> bool:

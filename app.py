@@ -760,6 +760,12 @@ SETUP_HTML = """
       const data = await r.json();
       if (data.status === 'success') { clearInterval(iv); saveAndRedirect(); }
       if (data.status === 'error')   { clearInterval(iv); show('view-login'); setError('error-box', data.message || 'Login failed.'); }
+      if (data.url) {
+        document.getElementById('push-prompt').textContent =
+          data.url.includes('howard.instructure.com')
+            ? 'Redirecting to Canvas...'
+            : 'Waiting for approval... (' + data.url.replace('https://', '').split('/')[0] + ')';
+      }
     }, 2000);
   }
 

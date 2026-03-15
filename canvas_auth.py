@@ -242,30 +242,42 @@ def _wait_for_push():
         return
 
     try:
-        for _ in range(150):   # 5 minutes
-            time.sleep(2)
+        start = time.time()
+        while time.time() - start < 300:  # 5-minute total timeout
+
+            # Event-driven: wait up to 8s for the browser to land on Canvas
             try:
-                # Handle "Stay signed in?" — click No
-                if _has_stay_signed_in(page):
-                    _click(page, '#idBtn_Back, input[value="No"]')
-                    try:
-                        page.wait_for_load_state("load", timeout=10_000)
-                    except PlaywrightTimeout:
-                        pass
+                page.wait_for_url(f"*{CANVAS_URL}*", timeout=8_000)
+                _finish(page)
+                return
+            except PlaywrightTimeout:
+                pass
+            except Exception as e:
+                err = str(e).lower()
+                if any(k in err for k in ["closed", "target", "destroyed"]):
+                    _set(status="error", message="Browser session lost. Please try again.")
+                    return
+
+            # Not on Canvas yet — check what page we're on
+            try:
+                current_url = page.url
+                # Update state so the frontend can show debug info if needed
+                _set(status="needs_push", url=current_url)
 
                 if _on_canvas(page):
                     _finish(page)
                     return
 
-            except PlaywrightTimeout:
-                pass   # page mid-navigation, keep polling
+                # "Stay signed in?" — dismiss it
+                if _has_stay_signed_in(page):
+                    page.locator('#idBtn_Back, button:has-text("No"), input[value="No"]').first.click()
+                    time.sleep(1)
+
             except Exception as e:
                 err = str(e).lower()
-                # Page was closed or context destroyed — session gone
-                if "closed" in err or "target" in err or "destroyed" in err:
+                if any(k in err for k in ["closed", "target", "destroyed"]):
                     _set(status="error", message="Browser session lost. Please try again.")
                     return
-                # Otherwise keep polling
 
         _set(status="error", message="Push notification timed out. Please try again.")
     except Exception as e:

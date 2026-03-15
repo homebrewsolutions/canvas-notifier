@@ -23,7 +23,7 @@ def get_upcoming_assignments(access_token: str = None, cookies: dict = None) -> 
     """
     Return assignments due in the next DAYS_AHEAD days.
 
-    Calls GET /api/v1/calendar_events?type=assignment on Howard's Canvas.
+    Fetches active courses first, then assignments per course.
     Authenticates via access_token (bearer) or session cookies.
     """
     token = access_token or os.getenv("CANVAS_ACCESS_TOKEN")
@@ -34,53 +34,65 @@ def get_upcoming_assignments(access_token: str = None, cookies: dict = None) -> 
     end       = now + timedelta(days=DAYS_AHEAD)
     now_local = now.astimezone(DISPLAY_TZ)
 
-    params = {
-        "type":       "assignment",
-        "start_date": now.date().isoformat(),
-        "end_date":   end.date().isoformat(),
-        "per_page":   100,
-    }
-    if token:
-        params["access_token"] = token
+    def api_get(path, params=None):
+        p = dict(params or {})
+        if token:
+            p["access_token"] = token
+        resp = requests.get(f"{CANVAS_BASE}{path}", params=p,
+                            cookies=cookies or {}, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
 
-    resp = requests.get(
-        f"{CANVAS_BASE}/api/v1/calendar_events",
-        params=params,
-        cookies=cookies or {},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    events = resp.json()
+    # Get all active courses
+    courses = api_get("/api/v1/courses", {
+        "enrollment_state": "active",
+        "per_page": 50,
+    })
+    if not isinstance(courses, list):
+        return []
 
-    if not isinstance(events, list):
-        events = []
+    print(f"[canvas] found {len(courses)} active courses", flush=True)
 
     assignments = []
-    for ev in events:
-        due_dt = _parse_dt(ev.get("start_at") or ev.get("end_at"))
-        if due_dt is None or not (now <= due_dt <= end):
+    for course in courses:
+        if not isinstance(course, dict) or "id" not in course:
+            continue
+        course_id   = course["id"]
+        course_name = course.get("name") or course.get("course_code") or "Unknown Course"
+
+        try:
+            items = api_get(f"/api/v1/courses/{course_id}/assignments", {
+                "bucket":   "upcoming",
+                "per_page": 50,
+                "order_by": "due_at",
+            })
+        except Exception:
             continue
 
-        assignment  = ev.get("assignment") or {}
-        course      = ev.get("context_name") or "Unknown Course"
-        title       = ev.get("title") or assignment.get("name") or "Unnamed Assignment"
-        points      = assignment.get("points_possible", "?")
-        description = _strip_html(str(assignment.get("description") or ""))
-        url         = ev.get("html_url") or ""
-        due_local   = due_dt.astimezone(DISPLAY_TZ)
+        if not isinstance(items, list):
+            continue
 
-        assignments.append({
-            "course":      course,
-            "title":       title,
-            "due":         due_dt,
-            "due_str":     due_local.strftime("%A, %b %-d @ %-I:%M %p"),
-            "days_left":   (due_local.date() - now_local.date()).days,
-            "points":      points,
-            "description": description,
-            "url":         url,
-        })
+        for a in items:
+            if not isinstance(a, dict):
+                continue
+            due_dt = _parse_dt(a.get("due_at"))
+            if due_dt is None or not (now <= due_dt <= end):
+                continue
+
+            due_local = due_dt.astimezone(DISPLAY_TZ)
+            assignments.append({
+                "course":      course_name,
+                "title":       a.get("name") or "Unnamed Assignment",
+                "due":         due_dt,
+                "due_str":     due_local.strftime("%A, %b %-d @ %-I:%M %p"),
+                "days_left":   (due_local.date() - now_local.date()).days,
+                "points":      a.get("points_possible", "?"),
+                "description": _strip_html(str(a.get("description") or "")),
+                "url":         a.get("html_url") or "",
+            })
 
     assignments.sort(key=lambda x: x["due"])
+    print(f"[canvas] found {len(assignments)} upcoming assignments", flush=True)
     return assignments
 
 

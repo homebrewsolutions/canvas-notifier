@@ -313,15 +313,38 @@ def _generate_api_token(page) -> str | None:
 
 def _get_display_number(page) -> str | None:
     """Extract the number matching digit Microsoft shows on the push screen."""
-    for sel in ['#idRichContext_DisplaySign', '.displaySign', '[data-bind*="DisplaySign"]']:
+    selectors = [
+        '#idRichContext_DisplaySign',
+        '#displaySign',
+        '.displaySign',
+        '[data-bind*="DisplaySign"]',
+        '#idDiv_SAOTCC_DisplaySign',
+    ]
+    # Wait for any of the number elements to appear (Microsoft renders it async)
+    for sel in selectors:
         try:
+            page.wait_for_selector(sel, timeout=5_000)
             el = page.locator(sel).first
             if el.count() > 0:
-                text = (el.text_content() or "").strip()
+                tag  = el.evaluate("e => e.tagName").upper()
+                text = (el.input_value() if tag == "INPUT" else el.text_content() or "").strip()
                 if text:
                     return text
+        except PlaywrightTimeout:
+            continue
         except Exception:
-            pass
+            continue
+
+    # Fallback: scan page HTML for a standalone 2-digit number
+    import re
+    try:
+        html = page.content()
+        match = re.search(r'(?<!\d)(\d{2})(?!\d)', html)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+
     return None
 
 

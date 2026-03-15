@@ -242,41 +242,47 @@ def _wait_for_push():
         return
 
     try:
-        start = time.time()
-        login_url = page.url  # The number-matching page we started on
+        start_url = page.url
+        print(f"[push] waiting for approval, start url: {start_url}", flush=True)
 
-        while time.time() - start < 300:  # 5-minute total timeout
+        for _ in range(150):  # 5 minutes
             time.sleep(2)
             try:
-                current_url = page.url
+                url = page.url
+                print(f"[push] current url: {url}", flush=True)
 
-                # Already on Canvas — done
-                if _on_canvas(page):
+                # Success — on Canvas
+                if CANVAS_URL in url:
+                    print("[push] on canvas, finishing", flush=True)
                     _finish(page)
                     return
 
-                # "Stay signed in?" — click No and continue
-                if _has_stay_signed_in(page):
-                    page.locator('#idBtn_Back, button:has-text("No"), input[value="No"]').first.click()
-                    time.sleep(2)
+                # Still on number matching page — not approved yet
+                if url == start_url:
                     continue
 
-                # We've navigated away from the original login page but are still
-                # on a Microsoft domain (e.g. "You're all set!" or an intermediate
-                # redirect page). Navigate directly to Canvas — SSO cookies are set.
-                if current_url != login_url and _is_microsoft_page(current_url):
-                    try:
-                        page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
-                    except PlaywrightTimeout:
-                        pass
-                    if _on_canvas(page):
-                        _finish(page)
-                        return
+                # URL changed — "Stay signed in?" check first
+                if _has_stay_signed_in(page):
+                    print("[push] dismissing stay-signed-in", flush=True)
+                    page.locator('#idBtn_Back, button:has-text("No"), input[value="No"]').first.click()
+                    # Let Microsoft redirect naturally to Canvas
+                    continue
+
+                # Other intermediate Microsoft page — navigate to Canvas directly
+                print(f"[push] intermediate page, navigating to canvas", flush=True)
+                try:
+                    page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
+                except PlaywrightTimeout:
+                    pass
+                if _on_canvas(page):
+                    _finish(page)
+                    return
 
             except PlaywrightTimeout:
                 pass
             except Exception as e:
                 err = str(e).lower()
+                print(f"[push] exception: {e}", flush=True)
                 if any(k in err for k in ["closed", "target", "destroyed"]):
                     _set(status="error", message="Browser session lost. Please try again.")
                     return

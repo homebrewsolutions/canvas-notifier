@@ -73,7 +73,7 @@ def start_login(email: str, password: str) -> dict:
             _session["page"]    = page
 
         # Navigate to Canvas — it will redirect to Microsoft SSO automatically
-        page.goto(CANVAS_URL, wait_until="networkidle", timeout=30_000)
+        page.goto(CANVAS_URL, wait_until="load", timeout=30_000)
 
         # If already on Canvas (cached session), finish immediately
         if _on_canvas(page):
@@ -108,7 +108,7 @@ def start_login(email: str, password: str) -> dict:
         # Fill password and sign in
         page.fill('input[name="passwd"]', password)
         page.click('#idSIButton9')
-        page.wait_for_load_state("networkidle", timeout=15_000)
+        page.wait_for_load_state("load", timeout=15_000)
 
         # Check for bad credentials
         if _has_error(page):
@@ -139,7 +139,7 @@ def start_login(email: str, password: str) -> dict:
         # "Stay signed in?" prompt — click No and proceed
         if _has_stay_signed_in(page):
             _click(page, '#idBtn_Back, input[value="No"]')
-            page.wait_for_load_state("networkidle", timeout=10_000)
+            page.wait_for_load_state("load", timeout=10_000)
             if _on_canvas(page):
                 return _finish(page)
 
@@ -171,19 +171,47 @@ def submit_code(code: str) -> dict:
         return _set(status="error", message="No active login session. Please start over.")
 
     try:
-        _wait_and_fill(page, 'input[name="otc"], input[name="code"], input[autocomplete="one-time-code"]', code)
+        # Find and fill whichever OTC input is actually present
+        code_selectors = [
+            'input[name="otc"]',
+            'input[name="code"]',
+            'input[autocomplete="one-time-code"]',
+        ]
+        filled = False
+        for sel in code_selectors:
+            try:
+                page.wait_for_selector(sel, timeout=5_000)
+                page.fill(sel, code)
+                filled = True
+                break
+            except PlaywrightTimeout:
+                continue
+        if not filled:
+            return _set(status="error", message="Could not find the verification code input. Please try again.")
+
         _click(page, '#idSubmit_SAOTCC_Continue, #idSIButton9, input[type="submit"]')
-        page.wait_for_load_state("networkidle", timeout=15_000)
+
+        # Wait for the page to move on — use load (not networkidle) since Microsoft
+        # auth pages have continuous background network activity that blocks networkidle.
+        page.wait_for_load_state("load", timeout=20_000)
 
         if _has_error(page):
             return _set(status="error", message=_error_text(page) or "Invalid code. Please try again.")
 
         if _has_stay_signed_in(page):
             _click(page, '#idBtn_Back, input[value="No"]')
-            page.wait_for_load_state("networkidle", timeout=10_000)
+            page.wait_for_load_state("load", timeout=10_000)
 
         if _on_canvas(page):
             return _finish(page)
+
+        # Give the page a moment to fully redirect to Canvas
+        try:
+            page.wait_for_url(f"{CANVAS_URL}/**", timeout=10_000)
+            if _on_canvas(page):
+                return _finish(page)
+        except PlaywrightTimeout:
+            pass
 
         return _set(status="error", message="Code accepted but could not reach Canvas.")
 
@@ -218,7 +246,7 @@ def _wait_for_push():
             try:
                 if _has_stay_signed_in(page):
                     _click(page, '#idBtn_Back, input[value="No"]')
-                    page.wait_for_load_state("networkidle", timeout=10_000)
+                    page.wait_for_load_state("load", timeout=10_000)
 
                 if _on_canvas(page):
                     _finish(page)
@@ -245,7 +273,7 @@ def _finish(page) -> dict:
 
 def _generate_api_token(page) -> str | None:
     try:
-        page.goto(f"{CANVAS_URL}/profile/settings", wait_until="networkidle", timeout=15_000)
+        page.goto(f"{CANVAS_URL}/profile/settings", wait_until="load", timeout=15_000)
 
         btn = page.locator(
             'a[href="#access_token_form"], .add_access_token_link, '

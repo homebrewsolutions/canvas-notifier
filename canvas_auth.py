@@ -130,11 +130,12 @@ def start_login(email: str, password: str) -> dict:
 
         if twofa == "push":
             prompt = _get_2fa_prompt(page)
-            _set(status="needs_push", prompt=prompt)
+            number = _get_display_number(page)
+            _set(status="needs_push", prompt=prompt, number=number)
             # Wait for phone approval in background
             t = threading.Thread(target=_wait_for_push, daemon=True)
             t.start()
-            return {"status": "needs_push", "prompt": prompt}
+            return {"status": "needs_push", "prompt": prompt, "number": number}
 
         # "Stay signed in?" prompt — click No and proceed
         if _has_stay_signed_in(page):
@@ -308,6 +309,20 @@ def _generate_api_token(page) -> str | None:
         return None
     except Exception:
         return None
+
+
+def _get_display_number(page) -> str | None:
+    """Extract the number matching digit Microsoft shows on the push screen."""
+    for sel in ['#idRichContext_DisplaySign', '.displaySign', '[data-bind*="DisplaySign"]']:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                text = (el.text_content() or "").strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+    return None
 
 
 def _detect_2fa(page) -> str | None:

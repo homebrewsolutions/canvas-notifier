@@ -647,6 +647,10 @@ SETUP_HTML = """
       <div class="logo">📱</div>
       <h1>Check your phone</h1>
       <div class="waiting-box">
+        <div id="match-number-box" style="display:none;margin-bottom:18px">
+          <p style="font-size:0.85rem;color:#aaa;margin-bottom:8px">Tap this number in the Authenticator app:</p>
+          <div id="match-number" style="font-size:3.5rem;font-weight:700;color:#fff;letter-spacing:0.15em;line-height:1"></div>
+        </div>
         <div class="spinner-ring"></div>
         <p id="push-prompt">Approve the sign-in request in your Microsoft Authenticator app.</p>
       </div>
@@ -706,7 +710,16 @@ SETUP_HTML = """
     const data = await res.json();
 
     if (data.status === 'success')    { saveAndRedirect(); return; }
-    if (data.status === 'needs_push') { show('view-push'); document.getElementById('push-prompt').textContent = data.prompt || ''; startPolling(); return; }
+    if (data.status === 'needs_push') {
+      show('view-push');
+      document.getElementById('push-prompt').textContent = data.prompt || '';
+      if (data.number) {
+        document.getElementById('match-number').textContent = data.number;
+        document.getElementById('match-number-box').style.display = 'block';
+      }
+      startPolling();
+      return;
+    }
     if (data.status === 'needs_code') { show('view-code'); document.getElementById('code-prompt').textContent = data.prompt || ''; return; }
 
     // error

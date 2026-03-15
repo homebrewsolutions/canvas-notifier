@@ -243,32 +243,38 @@ def _wait_for_push():
 
     try:
         start = time.time()
+        login_url = page.url  # The number-matching page we started on
+
         while time.time() - start < 300:  # 5-minute total timeout
-
-            # Event-driven: wait up to 8s for the browser to land on Canvas
+            time.sleep(2)
             try:
-                page.wait_for_url(f"*{CANVAS_URL}*", timeout=8_000)
-                _finish(page)
-                return
-            except PlaywrightTimeout:
-                pass
-            except Exception as e:
-                err = str(e).lower()
-                if any(k in err for k in ["closed", "target", "destroyed"]):
-                    _set(status="error", message="Browser session lost. Please try again.")
-                    return
+                current_url = page.url
 
-            # Not on Canvas yet — check what page we're on
-            try:
+                # Already on Canvas — done
                 if _on_canvas(page):
                     _finish(page)
                     return
 
-                # "Stay signed in?" — dismiss it
+                # "Stay signed in?" — click No and continue
                 if _has_stay_signed_in(page):
                     page.locator('#idBtn_Back, button:has-text("No"), input[value="No"]').first.click()
-                    time.sleep(1)
+                    time.sleep(2)
+                    continue
 
+                # We've navigated away from the original login page but are still
+                # on a Microsoft domain (e.g. "You're all set!" or an intermediate
+                # redirect page). Navigate directly to Canvas — SSO cookies are set.
+                if current_url != login_url and _is_microsoft_page(current_url):
+                    try:
+                        page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
+                    except PlaywrightTimeout:
+                        pass
+                    if _on_canvas(page):
+                        _finish(page)
+                        return
+
+            except PlaywrightTimeout:
+                pass
             except Exception as e:
                 err = str(e).lower()
                 if any(k in err for k in ["closed", "target", "destroyed"]):
@@ -445,6 +451,10 @@ def _on_canvas(page) -> bool:
         return CANVAS_URL in page.url
     except Exception:
         return False
+
+
+def _is_microsoft_page(url: str) -> bool:
+    return any(d in url for d in ["microsoftonline.com", "microsoft.com", "live.com", "login.windows.net"])
 
 
 def _has_stay_signed_in(page) -> bool:

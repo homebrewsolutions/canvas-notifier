@@ -349,34 +349,45 @@ def _get_display_number(page) -> str | None:
 
 
 def _detect_2fa(page) -> str | None:
-    """Return 'code', 'push', or None."""
-    # Check for number matching display element first — its presence means push, not code.
-    # Microsoft number matching pages often contain "enter the number" which would
-    # otherwise be misclassified as a code-entry screen.
-    number_match_selectors = [
-        '#idRichContext_DisplaySign',
-        '#displaySign',
-        '.displaySign',
-        '[data-bind*="DisplaySign"]',
-        '#idDiv_SAOTCC_DisplaySign',
-    ]
-    for sel in number_match_selectors:
+    """Return 'code', 'push', or None. Waits for the 2FA UI to actually render."""
+    number_match_sel = (
+        '#idRichContext_DisplaySign, #displaySign, .displaySign, '
+        '[data-bind*="DisplaySign"], #idDiv_SAOTCC_DisplaySign'
+    )
+    code_input_sel = (
+        'input[name="otc"], input[name="code"], input[autocomplete="one-time-code"]'
+    )
+
+    # Wait up to 10s for whichever 2FA element appears first
+    try:
+        page.wait_for_selector(f'{number_match_sel}, {code_input_sel}', timeout=10_000)
+    except PlaywrightTimeout:
+        pass
+
+    # Number matching element present → push (must check before code input
+    # because Microsoft's number matching page can also have hidden code inputs)
+    for sel in number_match_sel.split(', '):
         try:
-            if page.locator(sel).count() > 0:
+            if page.locator(sel.strip()).count() > 0:
                 return "push"
         except Exception:
             pass
 
-    html = page.content().lower()
+    # Visible code input → code entry
+    for sel in code_input_sel.split(', '):
+        try:
+            el = page.locator(sel.strip()).first
+            if el.count() > 0 and el.is_visible():
+                return "code"
+        except Exception:
+            pass
 
-    # Number matching detected by page text
-    if any(k in html for k in ["enter the number shown", "number shown", "idrichcontext_displaysign"]):
+    # Text fallback
+    html = page.content().lower()
+    if any(k in html for k in ["enter the number shown", "number shown", "approve sign in",
+                                "open your authenticator", "push notification", "number matching"]):
         return "push"
-    # Plain push / Authenticator app approval
-    if any(k in html for k in ["approve sign in", "open your authenticator", "push notification", "number matching"]):
-        return "push"
-    # Code entry (TOTP / SMS) — checked last so number matching pages don't fall in here
-    if any(k in html for k in ["otc", "verification code", "enter the code", "one-time"]):
+    if any(k in html for k in ["verification code", "enter the code", "one-time", "otc"]):
         return "code"
     return None
 

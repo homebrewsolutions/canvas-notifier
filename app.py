@@ -645,14 +645,17 @@ SETUP_HTML = """
     <!-- Step 2a: Authenticator push — just wait -->
     <div id="view-push" style="display:none">
       <div class="logo">📱</div>
-      <h1>Check your phone</h1>
+      <h1>Check your Authenticator app</h1>
       <div class="waiting-box">
-        <div id="match-number-box" style="display:none;margin-bottom:18px">
-          <p style="font-size:0.85rem;color:#aaa;margin-bottom:8px">Tap this number in the Authenticator app:</p>
-          <div id="match-number" style="font-size:3.5rem;font-weight:700;color:#fff;letter-spacing:0.15em;line-height:1"></div>
+        <div id="match-number-box" style="display:none;margin-bottom:22px">
+          <p style="font-size:0.9rem;color:#aaa;margin-bottom:10px">
+            Your Authenticator app is asking for a number.<br>
+            Enter this number into the app:
+          </p>
+          <div id="match-number" style="font-size:4rem;font-weight:700;color:#fff;letter-spacing:0.2em;line-height:1;margin-bottom:6px"></div>
         </div>
         <div class="spinner-ring"></div>
-        <p id="push-prompt">Approve the sign-in request in your Microsoft Authenticator app.</p>
+        <p id="push-prompt">Open your Microsoft Authenticator app and approve the sign-in request.</p>
       </div>
       <a class="retry-link" href="/setup">Start over</a>
     </div>

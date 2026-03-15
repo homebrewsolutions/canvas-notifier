@@ -245,15 +245,27 @@ def _wait_for_push():
         for _ in range(150):   # 5 minutes
             time.sleep(2)
             try:
+                # Handle "Stay signed in?" — click No
                 if _has_stay_signed_in(page):
                     _click(page, '#idBtn_Back, input[value="No"]')
-                    page.wait_for_load_state("load", timeout=10_000)
+                    try:
+                        page.wait_for_load_state("load", timeout=10_000)
+                    except PlaywrightTimeout:
+                        pass
 
                 if _on_canvas(page):
                     _finish(page)
                     return
-            except Exception:
-                pass
+
+            except PlaywrightTimeout:
+                pass   # page mid-navigation, keep polling
+            except Exception as e:
+                err = str(e).lower()
+                # Page was closed or context destroyed — session gone
+                if "closed" in err or "target" in err or "destroyed" in err:
+                    _set(status="error", message="Browser session lost. Please try again.")
+                    return
+                # Otherwise keep polling
 
         _set(status="error", message="Push notification timed out. Please try again.")
     except Exception as e:
@@ -422,12 +434,7 @@ def _error_text(page) -> str:
 
 def _on_canvas(page) -> bool:
     try:
-        url = page.url
-        return CANVAS_URL in url and (
-            "/dashboard" in url
-            or url.rstrip("/") == CANVAS_URL
-            or page.locator("#dashboard_header_container, .ic-Dashboard-header").count() > 0
-        )
+        return CANVAS_URL in page.url
     except Exception:
         return False
 

@@ -297,62 +297,30 @@ def _wait_for_push(page):
 # ─────────────────────────────────────────────
 
 def _finish(page) -> dict:
-    token = _generate_api_token(page)
-    if token:
-        return _set(status="success", token=token)
-    return _set(status="error", message="Logged in but could not generate a Canvas API token.")
+    cookies = _extract_cookies(page)
+    if cookies:
+        return _set(status="success", cookies=cookies)
+    return _set(status="error", message="Logged in but could not extract Canvas session cookies.")
 
 
-def _generate_api_token(page) -> str | None:
+def _extract_cookies(page) -> dict | None:
+    """Extract Canvas session cookies from the logged-in browser."""
     try:
-        print(f"[token] navigating to profile settings, url={page.url}", flush=True)
-        page.goto(f"{CANVAS_URL}/profile/settings", wait_until="load", timeout=15_000)
-        print(f"[token] on settings page, url={page.url}", flush=True)
+        # Make sure we're on Canvas first
+        if CANVAS_URL not in page.url:
+            page.goto(CANVAS_URL, wait_until="load", timeout=15_000)
 
-        btn = page.locator(
-            'a[href="#access_token_form"], .add_access_token_link, '
-            'button:has-text("New Access Token"), a:has-text("New Access Token")'
-        ).first
+        cookies = page.context.cookies()
+        cookie_dict = {c["name"]: c["value"] for c in cookies if CANVAS_URL.split("//")[1] in c.get("domain", "")}
+        print(f"[cookies] extracted {len(cookie_dict)} canvas cookies", flush=True)
 
-        if btn.count() == 0:
-            print("[token] ERROR: could not find New Access Token button", flush=True)
-            return None
+        if cookie_dict:
+            return cookie_dict
 
-        btn.click()
-        print("[token] clicked New Access Token", flush=True)
-
-        page.wait_for_selector(
-            '#access_token_form, #access-token-form, [data-testid="access-token-form"]',
-            timeout=8_000
-        )
-        print("[token] token form appeared", flush=True)
-
-        purpose = page.locator('input[name="access_token[purpose]"], #access_token_purpose').first
-        if purpose.count() > 0:
-            purpose.fill("Canvas Notifier")
-
-        page.locator('button:has-text("Generate Token"), input[value="Generate Token"]').first.click()
-        print("[token] clicked Generate Token", flush=True)
-
-        page.wait_for_selector(
-            '.visible_token, #token_value, [data-testid="access-token-value"], input.token-value',
-            timeout=10_000
-        )
-
-        for sel in ['.visible_token', '#token_value', '[data-testid="access-token-value"]', 'input.token-value']:
-            el = page.locator(sel).first
-            if el.count() > 0:
-                tag   = el.evaluate("e => e.tagName")
-                token = el.input_value() if tag == "INPUT" else el.text_content()
-                token = (token or "").strip()
-                if len(token) > 10:
-                    print(f"[token] got token (len={len(token)})", flush=True)
-                    return token
-
-        print("[token] ERROR: token element not found after generation", flush=True)
+        print("[cookies] ERROR: no canvas cookies found", flush=True)
         return None
     except Exception as e:
-        print(f"[token] ERROR: {e}", flush=True)
+        print(f"[cookies] ERROR: {e}", flush=True)
         return None
 
 

@@ -19,30 +19,34 @@ DAYS_AHEAD  = int(os.getenv("DAYS_AHEAD", 14))
 DISPLAY_TZ  = ZoneInfo(os.getenv("TIMEZONE", "America/New_York"))
 
 
-def get_upcoming_assignments(access_token: str = None) -> list[dict]:
+def get_upcoming_assignments(access_token: str = None, cookies: dict = None) -> list[dict]:
     """
     Return assignments due in the next DAYS_AHEAD days.
 
     Calls GET /api/v1/calendar_events?type=assignment on Howard's Canvas.
-    Falls back to CANVAS_ACCESS_TOKEN env var if no token is provided.
+    Authenticates via access_token (bearer) or session cookies.
     """
     token = access_token or os.getenv("CANVAS_ACCESS_TOKEN")
-    if not token:
-        raise ValueError("No Canvas access token. Please log in.")
+    if not token and not cookies:
+        raise ValueError("No Canvas credentials. Please log in.")
 
     now       = datetime.now(timezone.utc)
     end       = now + timedelta(days=DAYS_AHEAD)
     now_local = now.astimezone(DISPLAY_TZ)
 
+    params = {
+        "type":       "assignment",
+        "start_date": now.date().isoformat(),
+        "end_date":   end.date().isoformat(),
+        "per_page":   100,
+    }
+    if token:
+        params["access_token"] = token
+
     resp = requests.get(
         f"{CANVAS_BASE}/api/v1/calendar_events",
-        params={
-            "access_token": token,
-            "type":         "assignment",
-            "start_date":   now.date().isoformat(),
-            "end_date":     end.date().isoformat(),
-            "per_page":     100,
-        },
+        params=params,
+        cookies=cookies or {},
         timeout=15,
     )
     resp.raise_for_status()
@@ -80,24 +84,28 @@ def get_upcoming_assignments(access_token: str = None) -> list[dict]:
     return assignments
 
 
-def get_grades(access_token: str = None) -> list[dict]:
+def get_grades(access_token: str = None, cookies: dict = None) -> list[dict]:
     """
     Return current grades for all active courses.
 
     Calls GET /api/v1/courses with total_scores included.
     """
     token = access_token or os.getenv("CANVAS_ACCESS_TOKEN")
-    if not token:
-        raise ValueError("No Canvas access token. Please log in.")
+    if not token and not cookies:
+        raise ValueError("No Canvas credentials. Please log in.")
+
+    params = {
+        "enrollment_state": "active",
+        "include[]":        "total_scores",
+        "per_page":         50,
+    }
+    if token:
+        params["access_token"] = token
 
     resp = requests.get(
         f"{CANVAS_BASE}/api/v1/courses",
-        params={
-            "access_token":    token,
-            "enrollment_state": "active",
-            "include[]":       "total_scores",
-            "per_page":        50,
-        },
+        params=params,
+        cookies=cookies or {},
         timeout=15,
     )
     resp.raise_for_status()

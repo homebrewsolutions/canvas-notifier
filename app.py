@@ -36,6 +36,10 @@ def get_access_token():
     """Return the Canvas API token from the session, falling back to .env."""
     return flask_session.get('canvas_access_token') or os.getenv('CANVAS_ACCESS_TOKEN')
 
+def get_canvas_cookies():
+    """Return Canvas session cookies stored after SSO login."""
+    return flask_session.get('canvas_cookies') or None
+
 
 def get_phone():
     """Return the user's phone number from the session, falling back to .env."""
@@ -48,7 +52,7 @@ def require_auth():
     exempt = ('/setup', '/sms', '/health')
     if any(request.path.startswith(e) for e in exempt):
         return
-    if not get_access_token():
+    if not get_access_token() and not get_canvas_cookies():
         return redirect(url_for('setup'))
     if not get_phone() and request.path != '/setup/phone':
         return redirect(url_for('setup_phone'))
@@ -484,7 +488,7 @@ def dashboard():
 @app.route("/api/assignments")
 def api_assignments():
     try:
-        assignments = get_upcoming_assignments(access_token=get_access_token())
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
         for a in assignments:
             a["due"] = a["due"].isoformat()
         return jsonify({"assignments": assignments})
@@ -495,7 +499,7 @@ def api_assignments():
 @app.route("/api/summary")
 def api_summary():
     try:
-        assignments = get_upcoming_assignments(access_token=get_access_token())
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
         summary = summarize_assignments(assignments)
         return jsonify({"summary": summary})
     except Exception as e:
@@ -505,7 +509,7 @@ def api_summary():
 @app.route("/api/schedule")
 def api_schedule():
     try:
-        assignments = get_upcoming_assignments(access_token=get_access_token())
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
         schedule = generate_study_schedule(assignments)
         return jsonify(schedule)
     except Exception as e:
@@ -515,7 +519,7 @@ def api_schedule():
 @app.route("/api/grades")
 def api_grades():
     try:
-        grades = get_grades(access_token=get_access_token())
+        grades = get_grades(access_token=get_access_token(), cookies=get_canvas_cookies())
         return jsonify({"grades": grades})
     except Exception as e:
         return jsonify({"grades": [], "error": str(e)}), 500
@@ -526,7 +530,7 @@ def api_ask():
     try:
         data        = request.get_json()
         question    = data.get("question", "")
-        assignments = get_upcoming_assignments(access_token=get_access_token())
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
         answer      = answer_question(question, assignments)
         return jsonify({"answer": answer})
     except Exception as e:
@@ -536,7 +540,7 @@ def api_ask():
 @app.route("/api/send-digest", methods=["POST"])
 def api_send_digest():
     try:
-        assignments = get_upcoming_assignments(access_token=get_access_token())
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
         summary     = summarize_assignments(assignments)
         send_sms(summary, to=get_phone())
         return jsonify({"ok": True})
@@ -816,11 +820,15 @@ def setup_status():
 
 @app.route("/setup/complete", methods=["POST"])
 def setup_complete():
-    """Save the token from a successful login into the session."""
+    """Save credentials from a successful login into the session."""
     result = get_status()
-    if result.get("status") == "success" and result.get("token"):
-        flask_session["canvas_access_token"] = result["token"]
-        return jsonify({"ok": True})
+    if result.get("status") == "success":
+        if result.get("token"):
+            flask_session["canvas_access_token"] = result["token"]
+            return jsonify({"ok": True})
+        if result.get("cookies"):
+            flask_session["canvas_cookies"] = result["cookies"]
+            return jsonify({"ok": True})
     return jsonify({"ok": False}), 400
 
 

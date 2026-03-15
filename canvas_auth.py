@@ -302,24 +302,34 @@ def _finish(page) -> dict:
 
 def _generate_api_token(page) -> str | None:
     try:
+        print(f"[token] navigating to profile settings, url={page.url}", flush=True)
         page.goto(f"{CANVAS_URL}/profile/settings", wait_until="load", timeout=15_000)
+        print(f"[token] on settings page, url={page.url}", flush=True)
 
         btn = page.locator(
             'a[href="#access_token_form"], .add_access_token_link, '
             'button:has-text("New Access Token"), a:has-text("New Access Token")'
         ).first
+
+        if btn.count() == 0:
+            print("[token] ERROR: could not find New Access Token button", flush=True)
+            return None
+
         btn.click()
+        print("[token] clicked New Access Token", flush=True)
 
         page.wait_for_selector(
             '#access_token_form, #access-token-form, [data-testid="access-token-form"]',
             timeout=8_000
         )
+        print("[token] token form appeared", flush=True)
 
         purpose = page.locator('input[name="access_token[purpose]"], #access_token_purpose').first
         if purpose.count() > 0:
             purpose.fill("Canvas Notifier")
 
         page.locator('button:has-text("Generate Token"), input[value="Generate Token"]').first.click()
+        print("[token] clicked Generate Token", flush=True)
 
         page.wait_for_selector(
             '.visible_token, #token_value, [data-testid="access-token-value"], input.token-value',
@@ -333,9 +343,13 @@ def _generate_api_token(page) -> str | None:
                 token = el.input_value() if tag == "INPUT" else el.text_content()
                 token = (token or "").strip()
                 if len(token) > 10:
+                    print(f"[token] got token (len={len(token)})", flush=True)
                     return token
+
+        print("[token] ERROR: token element not found after generation", flush=True)
         return None
-    except Exception:
+    except Exception as e:
+        print(f"[token] ERROR: {e}", flush=True)
         return None
 
 

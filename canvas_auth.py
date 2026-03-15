@@ -260,10 +260,6 @@ def _wait_for_push():
 
             # Not on Canvas yet — check what page we're on
             try:
-                current_url = page.url
-                # Update state so the frontend can show debug info if needed
-                _set(status="needs_push", url=current_url)
-
                 if _on_canvas(page):
                     _finish(page)
                     return

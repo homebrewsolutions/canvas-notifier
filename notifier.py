@@ -16,8 +16,13 @@ YOUR_PHONE_NUMBER  = os.getenv("YOUR_PHONE_NUMBER")
 
 def send_sms(message, to=None):
     """Send an SMS. Defaults to YOUR_PHONE_NUMBER if no `to` is provided."""
-    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    client    = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     recipient = to or YOUR_PHONE_NUMBER
+
+    print(f"[sms] sending to={recipient} from={TWILIO_FROM_NUMBER} len={len(message)}", flush=True)
+
+    if not recipient:
+        raise ValueError("No phone number — set YOUR_PHONE_NUMBER env var or enter it on setup.")
 
     # Split into chunks if over 1550 chars
     max_len = 1550
@@ -25,10 +30,11 @@ def send_sms(message, to=None):
 
     for i, chunk in enumerate(chunks):
         prefix = f"[{i+1}/{len(chunks)}] " if len(chunks) > 1 else ""
-        client.messages.create(
+        msg = client.messages.create(
             body=prefix + chunk,
             from_=TWILIO_FROM_NUMBER,
             to=recipient
         )
+        print(f"[sms] chunk {i+1}/{len(chunks)} sid={msg.sid} status={msg.status}", flush=True)
 
-    print(f"✅ SMS sent to {recipient} ({len(chunks)} message(s))")
+    print(f"[sms] done ({len(chunks)} message(s))", flush=True)

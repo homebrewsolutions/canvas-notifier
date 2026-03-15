@@ -142,7 +142,10 @@ def _login_thread(email: str, password: str):
             return
 
         # ── 2FA detection ─────────────────────────────────────────────────
+        print(f"[2fa] detecting, url={page.url}", flush=True)
+        print(f"[2fa] page title={page.title()}", flush=True)
         twofa = _detect_2fa(page)
+        print(f"[2fa] detected type={twofa}", flush=True)
 
         # ── Push / number-matching ────────────────────────────────────────
         if twofa == "push":
@@ -363,28 +366,39 @@ def _detect_2fa(page) -> str | None:
     try:
         page.wait_for_selector(f'{number_match_sel}, {code_input_sel}', timeout=10_000)
     except PlaywrightTimeout:
-        pass
+        print("[2fa] timed out waiting for 2fa elements", flush=True)
 
     for sel in number_match_sel.split(', '):
         try:
-            if page.locator(sel.strip()).count() > 0:
+            count = page.locator(sel.strip()).count()
+            print(f"[2fa] number_match sel={sel.strip()} count={count}", flush=True)
+            if count > 0:
                 return "push"
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[2fa] number_match sel={sel.strip()} error={e}", flush=True)
 
     for sel in code_input_sel.split(', '):
         try:
             el = page.locator(sel.strip()).first
-            if el.count() > 0 and el.is_visible():
+            count = el.count()
+            visible = el.is_visible() if count > 0 else False
+            print(f"[2fa] code_input sel={sel.strip()} count={count} visible={visible}", flush=True)
+            if count > 0 and visible:
                 return "code"
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[2fa] code_input sel={sel.strip()} error={e}", flush=True)
 
     html = page.content().lower()
-    if any(k in html for k in ["enter the number shown", "number shown", "approve sign in",
-                                "open your authenticator", "push notification", "number matching"]):
+    push_keywords = ["enter the number shown", "number shown", "approve sign in",
+                     "open your authenticator", "push notification", "number matching"]
+    code_keywords = ["verification code", "enter the code", "one-time", "otc"]
+    matched_push = [k for k in push_keywords if k in html]
+    matched_code = [k for k in code_keywords if k in html]
+    print(f"[2fa] text fallback: push_keywords={matched_push} code_keywords={matched_code}", flush=True)
+
+    if matched_push:
         return "push"
-    if any(k in html for k in ["verification code", "enter the code", "one-time", "otc"]):
+    if matched_code:
         return "code"
     return None
 

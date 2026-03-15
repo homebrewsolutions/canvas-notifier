@@ -13,6 +13,8 @@ Set your Twilio webhook to: https://YOUR_NGROK_URL/sms
 """
 
 import os
+import re
+import requests as _requests
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for, session as flask_session
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
@@ -632,22 +634,49 @@ SETUP_HTML = """
     .waiting-box p { font-size: 0.9rem; color: #aaa; line-height: 1.6; }
     .retry-link { display: block; text-align: center; margin-top: 14px; font-size: 0.82rem; color: #555; text-decoration: none; }
     .retry-link:hover { color: #7eb3ff; }
+    .detect-row {
+      display: flex; align-items: center; gap: 8px;
+      background: #001a33; border: 1px solid #7eb3ff33;
+      border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;
+      font-size: 0.85rem;
+    }
+    .detect-row .dot { width: 8px; height: 8px; border-radius: 50%; background: #4caf50; flex-shrink: 0; }
+    .detect-row .dot.pending { background: #ffa500; animation: pulse 1s infinite; }
+    .detect-row .dot.error { background: #ff4d4d; }
+    .detect-url { color: #9ecfff; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .detect-change { color: #555; cursor: pointer; font-size: 0.78rem; flex-shrink: 0; border: none; background: none; padding: 0; }
+    .detect-change:hover { color: #7eb3ff; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
   </style>
 </head>
 <body>
 <div class="container">
   <div class="card">
 
-    <!-- Step 1: Canvas URL + Email + Password -->
+    <!-- Step 1: Email + Password (Canvas URL auto-detected) -->
     <div id="view-login">
       <div class="logo">📚</div>
       <h1>Sign in to Canvas</h1>
-      <p class="subtitle">Enter your school's Canvas URL and login credentials.</p>
+      <p class="subtitle">Enter your school email and password to connect Canvas.</p>
       <div id="error-box" style="display:none" class="alert alert-error"></div>
-      <label>Canvas URL</label>
-      <input type="text" id="canvas-url" placeholder="https://yourschool.instructure.com" autocomplete="url"/>
+
       <label>Email</label>
-      <input type="email" id="email" placeholder="you@yourschool.edu" autocomplete="email"/>
+      <input type="email" id="email" placeholder="you@yourschool.edu" autocomplete="email"
+             onblur="detectCanvas()" oninput="resetDetect()"/>
+
+      <!-- Canvas URL detect row (shown after email entered) -->
+      <div id="detect-row" class="detect-row" style="display:none">
+        <span class="dot" id="detect-dot"></span>
+        <span class="detect-url" id="detect-url-text"></span>
+        <button class="detect-change" onclick="showManualUrl()" title="Enter URL manually">change</button>
+      </div>
+
+      <!-- Manual override input (hidden by default) -->
+      <div id="manual-url-row" style="display:none">
+        <label>Canvas URL</label>
+        <input type="text" id="canvas-url" placeholder="https://yourschool.instructure.com" autocomplete="url"/>
+      </div>
+
       <label>Password</label>
       <input type="password" id="password" placeholder="Your password" autocomplete="current-password"/>
       <button class="btn" id="login-btn" onclick="submitLogin()">Sign In</button>
@@ -694,6 +723,9 @@ SETUP_HTML = """
 </div>
 
 <script>
+  let detectedCanvasUrl = '';
+  let detectInFlight = false;
+
   function show(id) {
     ['view-login','view-push','view-code','view-success'].forEach(v =>
       document.getElementById(v).style.display = v === id ? 'block' : 'none'
@@ -706,12 +738,75 @@ SETUP_HTML = """
     b.style.display = msg ? 'block' : 'none';
   }
 
+  function resetDetect() {
+    detectedCanvasUrl = '';
+    document.getElementById('detect-row').style.display = 'none';
+  }
+
+  function showManualUrl() {
+    document.getElementById('manual-url-row').style.display = 'block';
+    document.getElementById('detect-row').style.display = 'none';
+    detectedCanvasUrl = '';
+  }
+
+  async function detectCanvas() {
+    const email = document.getElementById('email').value.trim();
+    if (!email || !email.includes('@')) return;
+    if (detectInFlight) return;
+
+    detectInFlight = true;
+    const row  = document.getElementById('detect-row');
+    const dot  = document.getElementById('detect-dot');
+    const text = document.getElementById('detect-url-text');
+
+    dot.className = 'dot pending';
+    text.textContent = 'Detecting your Canvas…';
+    row.style.display = 'flex';
+
+    try {
+      const res  = await fetch('/setup/detect-canvas', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ email })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        detectedCanvasUrl = data.url;
+        dot.className = 'dot';
+        text.textContent = data.url.replace('https://', '');
+      } else {
+        detectedCanvasUrl = '';
+        dot.className = 'dot error';
+        text.textContent = 'Not detected — enter URL below';
+        document.getElementById('manual-url-row').style.display = 'block';
+      }
+    } catch (e) {
+      dot.className = 'dot error';
+      text.textContent = 'Detection failed — enter URL below';
+      document.getElementById('manual-url-row').style.display = 'block';
+    } finally {
+      detectInFlight = false;
+    }
+  }
+
   async function submitLogin() {
-    const canvasUrl = document.getElementById('canvas-url').value.trim();
-    const email     = document.getElementById('email').value.trim();
-    const password  = document.getElementById('password').value;
-    if (!canvasUrl) { setError('error-box', 'Please enter your Canvas URL (e.g. https://yourschool.instructure.com).'); return; }
+    const email    = document.getElementById('email').value.trim();
+    const password = document.getElementById('password').value;
+
+    // Resolve canvas URL: detected > manual input > empty
+    const manualInput = document.getElementById('canvas-url');
+    const canvasUrl   = detectedCanvasUrl ||
+                        (manualInput ? manualInput.value.trim() : '');
+
     if (!email || !password) { setError('error-box', 'Please enter your email and password.'); return; }
+    if (!canvasUrl) {
+      // Try to detect now if not yet done
+      await detectCanvas();
+      if (!detectedCanvasUrl) {
+        setError('error-box', 'Could not detect your Canvas URL. Please click "change" to enter it manually.');
+        return;
+      }
+    }
 
     const btn = document.getElementById('login-btn');
     btn.disabled = true;
@@ -721,7 +816,7 @@ SETUP_HTML = """
     const res  = await fetch('/setup/login', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ canvas_url: canvasUrl, email, password })
+      body: JSON.stringify({ canvas_url: detectedCanvasUrl || canvasUrl, email, password })
     });
     const data = await res.json();
 
@@ -794,6 +889,59 @@ SETUP_HTML = """
 @app.route("/setup", methods=["GET"])
 def setup():
     return render_template_string(SETUP_HTML)
+
+
+@app.route("/setup/detect-canvas", methods=["POST"])
+def setup_detect_canvas():
+    """
+    Given an email address, try to find the Canvas base URL for that school.
+    Tries https://{school}.instructure.com and https://canvas.{domain}.
+    Returns {"ok": true, "url": "..."} or {"ok": false, "error": "..."}.
+    """
+    data  = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+    if "@" not in email:
+        return jsonify({"ok": False, "error": "Invalid email."})
+
+    domain = email.split("@", 1)[1]          # e.g. howard.edu
+    # Strip common student-subdomain prefixes: student.howard.edu → howard.edu
+    parts = domain.split(".")
+    # Try to get the base "school.tld" by dropping leading subdomains
+    # e.g. student.howard.edu → howard.edu; mail.uni.edu → uni.edu
+    if len(parts) > 2:
+        school_domain = ".".join(parts[-2:])  # last two segments
+    else:
+        school_domain = domain
+    school_name = school_domain.split(".")[0]  # e.g. "howard"
+
+    candidates = [
+        f"https://{school_name}.instructure.com",
+        f"https://canvas.{school_domain}",
+        f"https://canvas.{domain}",
+    ]
+    # De-duplicate while preserving order
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+
+    for url in unique:
+        try:
+            resp = _requests.head(
+                f"{url}/api/v1/courses",
+                timeout=5,
+                allow_redirects=True,
+            )
+            # A 401 means Canvas is there but requires auth — perfect.
+            # A 200/302/403 are also acceptable signs the server exists.
+            if resp.status_code in (200, 302, 401, 403):
+                return jsonify({"ok": True, "url": url})
+        except Exception:
+            continue
+
+    return jsonify({"ok": False, "error": f"Could not detect a Canvas instance for {school_domain}. Please enter the URL manually."})
 
 
 @app.route("/setup/login", methods=["POST"])
@@ -923,7 +1071,6 @@ def setup_phone():
     phone = request.form.get("phone", "").strip()
 
     # Basic validation — must start with + and have at least 10 digits
-    import re
     digits = re.sub(r"\D", "", phone)
     if not phone.startswith("+") or len(digits) < 10:
         return render_template_string(PHONE_HTML, error="Please enter a valid phone number with country code (e.g. +12025551234).",

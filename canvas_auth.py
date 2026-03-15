@@ -270,16 +270,24 @@ def _wait_for_push(page):
                     _finish(page)
                 return
 
-            # URL unchanged but number element gone → SPA approved
+            # URL unchanged but number element gone → approval processed
             gone = page.locator('#idRichContext_DisplaySign, #displaySign, .displaySign').count() == 0
             if gone:
-                print("[push] number element gone, going to canvas", flush=True)
+                print("[push] number element gone, waiting for SSO to settle", flush=True)
+                time.sleep(4)
+
+                # Handle "Stay signed in?" if it appears before Canvas redirect
+                if _has_stay_signed_in(page):
+                    print("[push] dismissing stay-signed-in after approval", flush=True)
+                    page.locator('#idBtn_Back, button:has-text("No"), input[value="No"]').first.click()
+                    time.sleep(2)
+
+                print("[push] navigating to canvas", flush=True)
                 try:
                     page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
                 except PlaywrightTimeout:
                     pass
-                if _on_canvas(page):
-                    _finish(page)
+                _finish(page)
                 return
 
         except Exception as e:

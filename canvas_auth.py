@@ -249,7 +249,7 @@ def _wait_for_push():
             time.sleep(2)
             try:
                 url = page.url
-                print(f"[push] current url: {url}", flush=True)
+                print(f"[push] url: {url}", flush=True)
 
                 # Success — on Canvas
                 if CANVAS_URL in url:
@@ -257,26 +257,39 @@ def _wait_for_push():
                     _finish(page)
                     return
 
-                # Still on number matching page — not approved yet
-                if url == start_url:
-                    continue
-
-                # URL changed — "Stay signed in?" check first
+                # "Stay signed in?" — check regardless of URL (Microsoft is a SPA,
+                # this can appear without a URL change)
                 if _has_stay_signed_in(page):
                     print("[push] dismissing stay-signed-in", flush=True)
                     page.locator('#idBtn_Back, button:has-text("No"), input[value="No"]').first.click()
-                    # Let Microsoft redirect naturally to Canvas
                     continue
 
-                # Other intermediate Microsoft page — navigate to Canvas directly
-                print(f"[push] intermediate page, navigating to canvas", flush=True)
-                try:
-                    page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
-                except PlaywrightTimeout:
-                    pass
-                if _on_canvas(page):
-                    _finish(page)
-                    return
+                # URL changed to a different Microsoft page
+                if url != start_url and _is_microsoft_page(url):
+                    print(f"[push] new microsoft page, navigating to canvas", flush=True)
+                    try:
+                        page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
+                    except PlaywrightTimeout:
+                        pass
+                    if _on_canvas(page):
+                        _finish(page)
+                        return
+                    continue
+
+                # URL unchanged — check if the number matching element has disappeared,
+                # which means approval was processed (SPA state change without URL change)
+                number_el = page.locator(
+                    '#idRichContext_DisplaySign, #displaySign, .displaySign'
+                )
+                if number_el.count() == 0:
+                    print("[push] number element gone, navigating to canvas", flush=True)
+                    try:
+                        page.goto(CANVAS_URL, wait_until="load", timeout=20_000)
+                    except PlaywrightTimeout:
+                        pass
+                    if _on_canvas(page):
+                        _finish(page)
+                        return
 
             except PlaywrightTimeout:
                 pass

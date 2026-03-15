@@ -350,11 +350,34 @@ def _get_display_number(page) -> str | None:
 
 def _detect_2fa(page) -> str | None:
     """Return 'code', 'push', or None."""
+    # Check for number matching display element first — its presence means push, not code.
+    # Microsoft number matching pages often contain "enter the number" which would
+    # otherwise be misclassified as a code-entry screen.
+    number_match_selectors = [
+        '#idRichContext_DisplaySign',
+        '#displaySign',
+        '.displaySign',
+        '[data-bind*="DisplaySign"]',
+        '#idDiv_SAOTCC_DisplaySign',
+    ]
+    for sel in number_match_selectors:
+        try:
+            if page.locator(sel).count() > 0:
+                return "push"
+        except Exception:
+            pass
+
     html = page.content().lower()
-    if any(k in html for k in ["otc", "verification code", "enter the code", "one-time"]):
-        return "code"
+
+    # Number matching detected by page text
+    if any(k in html for k in ["enter the number shown", "number shown", "idrichcontext_displaysign"]):
+        return "push"
+    # Plain push / Authenticator app approval
     if any(k in html for k in ["approve sign in", "open your authenticator", "push notification", "number matching"]):
         return "push"
+    # Code entry (TOTP / SMS) — checked last so number matching pages don't fall in here
+    if any(k in html for k in ["otc", "verification code", "enter the code", "one-time"]):
+        return "code"
     return None
 
 

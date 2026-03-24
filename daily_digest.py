@@ -8,7 +8,8 @@ Cron example (8 AM daily):
 
 from canvas import get_upcoming_assignments
 from ai import summarize_assignments
-from notifier import send_sms
+from notifier import send_whatsapp
+from due_date_tracker import check_for_due_date_changes, format_changes_sms
 
 
 def main():
@@ -16,12 +17,20 @@ def main():
     assignments = get_upcoming_assignments()
     print(f"   Found {len(assignments)} upcoming assignment(s).")
 
+    # Check for due date changes before sending the digest
+    changes = check_for_due_date_changes(assignments)
+    if changes:
+        print(f"⚠️  Detected {len(changes)} due date change(s) — sending alert...")
+        send_whatsapp(format_changes_sms(changes))
+    else:
+        print("   No due date changes detected.")
+
     print("🤖 Asking Claude to summarize...")
     summary = summarize_assignments(assignments)
-    print(f"\n--- SMS Preview ---\n{summary}\n-------------------\n")
+    print(f"\n--- WhatsApp Preview ---\n{summary}\n-------------------\n")
 
-    print("📱 Sending SMS...")
-    send_sms(summary)
+    print("📱 Sending WhatsApp message...")
+    send_whatsapp(summary)
     print("🎉 Done!")
 
 

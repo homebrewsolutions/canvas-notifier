@@ -1,25 +1,25 @@
 """
-app.py — Flask server
-  - Receives incoming SMS from Twilio (webhook) and replies with Claude's answer
-  - Serves a web dashboard showing assignments + AI insights
+app.py — Flask server (Howard Canvas AI Assistant)
+  - Serves a web dashboard showing assignments, grades, AI insights
+  - Sends WhatsApp notifications via CallMeBot (send-only)
+  - Supports per-assignment reminders (fires via background scheduler)
 
 Run locally:
   python3 app.py
-
-Then expose with ngrok:
-  ngrok http 5000
-
-Set your Twilio webhook to: https://YOUR_NGROK_URL/sms
 """
 
 import os
+import re
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for, session as flask_session
-from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 
 from canvas import get_upcoming_assignments, get_grades
 from ai import answer_question, summarize_assignments, generate_study_schedule
-from notifier import send_sms
+from notifier import send_whatsapp
+from due_date_tracker import check_for_due_date_changes
+from storage import save_registration, get_registration, save_reminder, get_reminders_for_phone, delete_reminder
+import scheduler as reminder_scheduler
 try:
     from canvas_auth import start_login, submit_code, get_status
     BROWSER_AUTH = True
@@ -42,14 +42,19 @@ def get_canvas_cookies():
 
 
 def get_phone():
-    """Return the user's phone number from the session, falling back to .env."""
-    return flask_session.get('user_phone') or os.getenv('TWILIO_TO')
+    """Return the user's phone number from session, falling back to .env."""
+    return flask_session.get('user_phone') or os.getenv('YOUR_PHONE_NUMBER')
+
+
+def get_api_key():
+    """Return the user's CallMeBot API key from session, falling back to .env."""
+    return flask_session.get('callmebot_api_key') or os.getenv('CALLMEBOT_API_KEY')
 
 
 @app.before_request
 def require_auth():
     """Redirect to /setup or /setup/phone if not fully configured."""
-    exempt = ('/setup', '/sms', '/health')
+    exempt = ('/setup', '/health', '/api/set-reminder', '/api/reminders', '/api/delete-reminder')
     if any(request.path.startswith(e) for e in exempt):
         return
     if not get_access_token() and not get_canvas_cookies():
@@ -148,6 +153,41 @@ DASHBOARD_HTML = """
       margin-left: 8px;
     }
     .dismiss-btn:hover { color: #ff6b6b; }
+    .reminder-row { margin-top: 8px; }
+    .reminder-btn {
+      background: none; border: 1px solid #333; border-radius: 6px;
+      color: #888; font-size: 0.78rem; padding: 4px 10px; cursor: pointer;
+    }
+    .reminder-btn:hover { border-color: #25d366; color: #25d366; }
+    .reminder-btn.active { border-color: #25d366; color: #25d366; background: #0a2e14; }
+    /* Reminder modal */
+    #reminder-modal {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.75); z-index: 1000;
+      align-items: center; justify-content: center;
+    }
+    .modal-card {
+      background: #1a1a1a; border: 1px solid #333; border-radius: 14px;
+      padding: 28px 28px 24px; max-width: 380px; width: 90%;
+    }
+    .modal-card h3 { color: #fff; margin-bottom: 4px; font-size: 1rem; }
+    .modal-due-info { color: #888; font-size: 0.82rem; margin-bottom: 18px; }
+    .modal-card label { font-size: 0.78rem; color: #aaa; text-transform: uppercase;
+                        letter-spacing:.04em; display: block; margin-bottom: 6px; }
+    .modal-card select {
+      width: 100%; background: #111; border: 1px solid #333; border-radius: 8px;
+      padding: 10px 12px; color: #eee; font-size: 0.88rem; margin-bottom: 16px; outline: none;
+    }
+    .modal-actions { display: flex; gap: 10px; }
+    .modal-actions button {
+      flex: 1; padding: 10px; border-radius: 8px; border: none;
+      font-size: 0.88rem; cursor: pointer; font-weight: 600;
+    }
+    .btn-confirm { background: #1a6e38; color: #fff; }
+    .btn-confirm:hover { background: #25a24e; }
+    .btn-cancel-modal { background: #2a2a2a; color: #aaa; }
+    .btn-cancel-modal:hover { background: #333; }
+    #modal-status { font-size: 0.8rem; margin-top: 10px; min-height: 1em; }
     .tag {
       display: inline-block;
       padding: 2px 8px;
@@ -257,6 +297,34 @@ DASHBOARD_HTML = """
     .grade-score  { font-size: 1.6rem; font-weight: 700; color: #fff; }
     .grade-letter { font-size: 0.9rem; color: #888; margin-left: 6px; }
     .grade-na     { font-size: 0.9rem; color: #555; }
+    .changes-banner {
+      background: #1f0a0a;
+      border: 1px solid #ff4d4d55;
+      border-left: 4px solid #ff4d4d;
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 24px;
+      display: none;
+    }
+    .changes-banner h2 {
+      font-size: 1rem;
+      color: #ff6b6b;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 12px;
+    }
+    .change-item {
+      padding: 10px 0;
+      border-bottom: 1px solid #2a1010;
+      font-size: 0.9rem;
+    }
+    .change-item:last-child { border-bottom: none; }
+    .change-title { font-weight: 600; color: #fff; }
+    .change-course { font-size: 0.8rem; color: #888; margin-bottom: 4px; }
+    .change-dates { color: #ccc; }
+    .change-dates .old { text-decoration: line-through; color: #ff6b6b; }
+    .change-dates .arrow { color: #555; margin: 0 6px; }
+    .change-dates .new { color: #4caf50; }
   </style>
 </head>
 <body>
@@ -270,6 +338,11 @@ DASHBOARD_HTML = """
 
   <main>
     <button class="refresh-btn" onclick="loadAll()">⟳ Refresh Data</button>
+
+    <div class="changes-banner" id="changes-banner">
+      <h2>⚠️ Due Date Changes Detected</h2>
+      <div id="changes-list"></div>
+    </div>
 
     <div class="grid">
       <!-- AI Summary -->
@@ -318,6 +391,12 @@ DASHBOARD_HTML = """
     function getDismissed() { return new Set(JSON.parse(localStorage.getItem('dismissed') || '[]')); }
     function saveDismissed(set) { localStorage.setItem('dismissed', JSON.stringify([...set])); }
 
+    const TEST_KEYWORDS = /quiz|test|exam|midterm|final|assessment/i;
+
+    function isTest(title) {
+      return TEST_KEYWORDS.test(title);
+    }
+
     function renderAssignments(assignments) {
       const aDiv = document.getElementById('assignments');
       if (assignments.length === 0) {
@@ -329,17 +408,108 @@ DASHBOARD_HTML = """
         if (a.days_left <= 1)      { urgencyClass='urgent';   tag='TODAY/TOMORROW'; tagClass='red'; }
         else if (a.days_left <= 3) { urgencyClass='soon';     tag=`${a.days_left}d left`; tagClass='orange'; }
         else                       { urgencyClass='upcoming'; tag=`${a.days_left}d left`; tagClass='green'; }
+        const testBadge = isTest(a.title)
+          ? `<span class="tag" style="background:#3d1a00;color:#ff9d4d;margin-right:6px">TEST/QUIZ</span>`
+          : '';
+        const rid = activeReminders[String(a.id)];
+        const reminderBtn = rid
+          ? `<button class="reminder-btn active" onclick="cancelReminder('${rid}', ${i})" title="Cancel reminder">⏰ Reminder set</button>`
+          : `<button class="reminder-btn" onclick="openReminder(${i})" title="Set a WhatsApp reminder">⏰ Remind me</button>`;
         return `
-          <div class="assignment ${urgencyClass}" id="assign-${i}">
+          <div class="assignment ${urgencyClass}" id="assign-${i}" data-due="${a.due}" data-due-str="${a.due_str}" data-title="${a.title.replace(/"/g,'&quot;')}" data-id="${a.id || i}">
             <button class="dismiss-btn" onclick="dismiss(${i})" title="Mark as done">&times;</button>
             <div class="title">${a.title}</div>
             <div class="meta">${a.course} · ${a.points} pts</div>
             <div class="due">
-              <span class="tag ${tagClass}">${tag}</span>
+              ${testBadge}<span class="tag ${tagClass}">${tag}</span>
               📅 ${a.due_str}
             </div>
+            <div class="reminder-row">${reminderBtn}</div>
           </div>`;
       }).join('');
+    }
+
+    // ── Reminder modal ────────────────────────────────────────────
+    let activeReminders = {};  // { assignmentId: reminderId }
+
+    async function loadReminders() {
+      try {
+        const res = await fetch('/api/reminders');
+        const data = await res.json();
+        activeReminders = {};
+        (data.reminders || []).forEach(r => { activeReminders[r.assignment_id] = r.id; });
+      } catch(e) { /* ignore */ }
+    }
+
+    function openReminder(i) {
+      const card = document.getElementById(`assign-${i}`);
+      const title   = card.dataset.title;
+      const due     = card.dataset.due;
+      const due_str = card.dataset.dueStr || card.dataset.due_str || card.querySelector('.due').textContent.trim();
+      const aid     = card.dataset.id;
+
+      document.getElementById('modal-title').textContent = title;
+      document.getElementById('modal-due').textContent   = due_str;
+      document.getElementById('modal-assign-index').value = i;
+      document.getElementById('modal-assign-id').value    = aid;
+      document.getElementById('modal-due-iso').value      = due;
+      document.getElementById('modal-due-str').value      = due_str;
+      document.getElementById('reminder-modal').style.display = 'flex';
+    }
+
+    function closeModal() {
+      document.getElementById('reminder-modal').style.display = 'none';
+      document.getElementById('modal-status').textContent = '';
+    }
+
+    async function confirmReminder() {
+      const offset = parseInt(document.getElementById('reminder-offset').value);
+      const aid    = document.getElementById('modal-assign-id').value;
+      const title  = document.getElementById('modal-title').textContent;
+      const due    = document.getElementById('modal-due-iso').value;
+      const dueStr = document.getElementById('modal-due-str').value;
+      const i      = parseInt(document.getElementById('modal-assign-index').value);
+
+      const statusEl = document.getElementById('modal-status');
+      statusEl.style.color = '#aaa';
+      statusEl.textContent = 'Setting reminder…';
+
+      try {
+        const res = await fetch('/api/set-reminder', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ id: aid, title, due, due_str: dueStr, offset_hours: offset })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          activeReminders[aid] = data.id;
+          const card = document.getElementById(`assign-${i}`);
+          card.querySelector('.reminder-btn').outerHTML =
+            `<button class="reminder-btn active" onclick="cancelReminder('${data.id}', ${i})" title="Cancel reminder">⏰ Reminder set</button>`;
+          statusEl.style.color = '#25d366';
+          statusEl.textContent = 'Reminder saved!';
+          setTimeout(closeModal, 1200);
+        } else {
+          statusEl.style.color = '#ff6b6b';
+          statusEl.textContent = data.error || 'Failed to set reminder.';
+        }
+      } catch(e) {
+        statusEl.style.color = '#ff6b6b';
+        statusEl.textContent = 'Network error.';
+      }
+    }
+
+    async function cancelReminder(rid, i) {
+      await fetch('/api/delete-reminder', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ id: rid })
+      });
+      const card = document.getElementById(`assign-${i}`);
+      const aid = card.dataset.id;
+      delete activeReminders[aid];
+      card.querySelector('.reminder-btn').outerHTML =
+        `<button class="reminder-btn" onclick="openReminder(${i})" title="Set a WhatsApp reminder">⏰ Remind me</button>`;
     }
 
     function dismiss(i) {
@@ -361,23 +531,50 @@ DASHBOARD_HTML = """
       }
     }
 
+    function renderChanges(changes) {
+      const banner = document.getElementById('changes-banner');
+      const list   = document.getElementById('changes-list');
+      if (!changes || changes.length === 0) {
+        banner.style.display = 'none';
+        return;
+      }
+      list.innerHTML = changes.map(c => `
+        <div class="change-item">
+          <div class="change-title">${c.title}</div>
+          <div class="change-course">${c.course}</div>
+          <div class="change-dates">
+            <span class="old">${c.old_due}</span>
+            <span class="arrow">→</span>
+            <span class="new">${c.new_due}</span>
+          </div>
+        </div>`).join('');
+      banner.style.display = 'block';
+    }
+
     async function loadAll() {
       document.getElementById('ai-summary').textContent = 'Loading...';
       document.getElementById('assignments').innerHTML = '<p class="loading">Fetching from Canvas...</p>';
       document.getElementById('schedule').innerHTML = '<p class="loading">Generating schedule...</p>';
       document.getElementById('grades').innerHTML = '<p class="loading">Fetching grades...</p>';
 
-      const [summaryRes, assignRes, schedRes, gradesRes] = await Promise.all([
+      const [summaryRes, assignRes, schedRes, gradesRes, changesRes] = await Promise.all([
         fetch('/api/summary'),
         fetch('/api/assignments'),
         fetch('/api/schedule'),
-        fetch('/api/grades')
+        fetch('/api/grades'),
+        fetch('/api/due-date-changes')
       ]);
+
+      // Load existing reminders before rendering cards
+      await loadReminders();
 
       const summaryData  = await summaryRes.json();
       const assignData   = await assignRes.json();
       const scheduleData = await schedRes.json();
       const gradesData   = await gradesRes.json();
+      const changesData  = await changesRes.json();
+
+      renderChanges(changesData.changes);
 
       cachedAssignments = assignData.assignments || [];
 
@@ -467,6 +664,31 @@ DASHBOARD_HTML = """
 
     loadAll();
   </script>
+
+  <!-- Reminder modal -->
+  <div id="reminder-modal">
+    <div class="modal-card">
+      <h3 id="modal-title"></h3>
+      <div class="modal-due-info">Due: <span id="modal-due"></span></div>
+      <label for="reminder-offset">Remind me</label>
+      <select id="reminder-offset">
+        <option value="1">1 hour before</option>
+        <option value="24" selected>1 day before</option>
+        <option value="48">2 days before</option>
+        <option value="72">3 days before</option>
+        <option value="168">1 week before</option>
+      </select>
+      <input type="hidden" id="modal-assign-id"/>
+      <input type="hidden" id="modal-assign-index"/>
+      <input type="hidden" id="modal-due-iso"/>
+      <input type="hidden" id="modal-due-str"/>
+      <div class="modal-actions">
+        <button class="btn-cancel-modal" onclick="closeModal()">Cancel</button>
+        <button class="btn-confirm" onclick="confirmReminder()">Set Reminder</button>
+      </div>
+      <div id="modal-status"></div>
+    </div>
+  </div>
 </body>
 </html>
 """
@@ -537,12 +759,22 @@ def api_ask():
         return jsonify({"answer": f"Error: {str(e)}"}), 500
 
 
+@app.route("/api/due-date-changes")
+def api_due_date_changes():
+    try:
+        assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
+        changes = check_for_due_date_changes(assignments)
+        return jsonify({"changes": changes})
+    except Exception as e:
+        return jsonify({"changes": [], "error": str(e)}), 500
+
+
 @app.route("/api/send-digest", methods=["POST"])
 def api_send_digest():
     try:
         assignments = get_upcoming_assignments(access_token=get_access_token(), cookies=get_canvas_cookies())
         summary     = summarize_assignments(assignments)
-        send_sms(summary, to=get_phone())
+        send_whatsapp(summary, to=get_phone(), api_key=get_api_key())
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -554,23 +786,61 @@ def logout():
     return redirect(url_for('setup'))
 
 
-@app.route("/sms", methods=["POST"])
-def sms_webhook():
-    """
-    Twilio calls this endpoint when you reply to the SMS.
-    Claude reads your question and texts back an answer.
-    """
-    incoming_msg = request.form.get("Body", "").strip()
-    resp         = MessagingResponse()
+# ─────────────────────────────────────────────
+#  REMINDER ENDPOINTS
+# ─────────────────────────────────────────────
+
+@app.route("/api/set-reminder", methods=["POST"])
+def api_set_reminder():
+    phone   = get_phone()
+    api_key = get_api_key()
+    if not phone or not api_key:
+        return jsonify({"ok": False, "error": "Not registered for WhatsApp notifications."}), 401
+
+    body = request.get_json(silent=True) or {}
+    assignment_id = body.get("id")
+    title         = body.get("title", "Assignment")
+    due_iso       = body.get("due")       # ISO string from frontend
+    due_str       = body.get("due_str", "")
+    offset_hours  = int(body.get("offset_hours", 24))  # how many hours before due
+
+    if not due_iso:
+        return jsonify({"ok": False, "error": "Missing due date."}), 400
 
     try:
-        assignments = get_upcoming_assignments()
-        answer      = answer_question(incoming_msg, assignments)
-        resp.message(answer)
+        due_dt      = datetime.fromisoformat(due_iso)
+        remind_dt   = due_dt - timedelta(hours=offset_hours)
+        remind_iso  = remind_dt.isoformat()
     except Exception as e:
-        resp.message(f"Sorry, something went wrong: {str(e)}")
+        return jsonify({"ok": False, "error": str(e)}), 400
 
-    return str(resp)
+    if remind_dt <= datetime.now(timezone.utc):
+        return jsonify({"ok": False, "error": "Reminder time is already in the past."}), 400
+
+    rid = save_reminder(phone, api_key, assignment_id, title, due_iso, remind_iso, due_str)
+    return jsonify({"ok": True, "id": rid, "remind_at": remind_iso})
+
+
+@app.route("/api/reminders")
+def api_reminders():
+    phone = get_phone()
+    if not phone:
+        return jsonify({"reminders": []})
+    reminders = get_reminders_for_phone(phone)
+    return jsonify({"reminders": reminders})
+
+
+@app.route("/api/delete-reminder", methods=["POST"])
+def api_delete_reminder():
+    phone = get_phone()
+    if not phone:
+        return jsonify({"ok": False}), 401
+    body = request.get_json(silent=True) or {}
+    rid  = body.get("id")
+    if rid:
+        delete_reminder(rid, phone)
+    return jsonify({"ok": True})
+
 
 
 # ─────────────────────────────────────────────
@@ -842,7 +1112,7 @@ PHONE_HTML = """
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Your Phone Number — Canvas Assistant</title>
+  <title>WhatsApp Setup — Canvas Assistant</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -854,45 +1124,75 @@ PHONE_HTML = """
       align-items: center;
       justify-content: center;
     }
-    .container { width: 100%; max-width: 440px; padding: 24px; }
+    .container { width: 100%; max-width: 480px; padding: 24px; }
     .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 14px; padding: 36px 32px; }
     .logo { font-size: 2rem; margin-bottom: 12px; }
     h1 { font-size: 1.3rem; color: #fff; margin-bottom: 6px; }
     .subtitle { font-size: 0.88rem; color: #777; margin-bottom: 24px; line-height: 1.6; }
-    label { display: block; font-size: 0.8rem; color: #aaa; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .04em; }
-    input[type="tel"] {
-      width: 100%; background: #111; border: 1px solid #333; border-radius: 8px;
-      padding: 11px 14px; color: #eee; font-size: 0.9rem; margin-bottom: 16px; outline: none;
+    .steps {
+      background: #111; border: 1px solid #2a2a2a; border-radius: 10px;
+      padding: 16px 18px; margin-bottom: 24px;
     }
-    input:focus { border-color: #7eb3ff; }
-    .hint { font-size: 0.78rem; color: #555; margin-top: -10px; margin-bottom: 18px; }
+    .steps-title { font-size: 0.75rem; color: #25d366; text-transform: uppercase;
+                   letter-spacing: .06em; margin-bottom: 10px; font-weight: 700; }
+    .steps ol { padding-left: 18px; }
+    .steps li { font-size: 0.82rem; color: #aaa; margin-bottom: 8px; line-height: 1.5; }
+    .steps li strong { color: #eee; }
+    .steps .wa-num { color: #25d366; font-weight: 700; font-size: 0.9rem; }
+    .steps .wa-msg { color: #7eb3ff; font-style: italic; }
+    label { display: block; font-size: 0.8rem; color: #aaa; margin-bottom: 6px;
+            text-transform: uppercase; letter-spacing: .04em; }
+    input[type="tel"], input[type="text"] {
+      width: 100%; background: #111; border: 1px solid #333; border-radius: 8px;
+      padding: 11px 14px; color: #eee; font-size: 0.9rem; margin-bottom: 6px; outline: none;
+    }
+    input:focus { border-color: #25d366; }
+    .hint { font-size: 0.78rem; color: #555; margin-bottom: 18px; }
     .btn {
-      display: block; width: 100%; background: #003a8c; color: white; border: none;
+      display: block; width: 100%; background: #1a6e38; color: white; border: none;
       border-radius: 8px; padding: 13px; font-size: 0.95rem; cursor: pointer; font-weight: 600;
     }
-    .btn:hover { background: #0055cc; }
+    .btn:hover { background: #25a24e; }
     .alert { padding: 12px 16px; border-radius: 8px; font-size: 0.88rem; margin-bottom: 18px; line-height: 1.5; }
     .alert-error { background: #3d0000; border-left: 4px solid #ff4d4d; color: #ff9999; }
+    .expires { font-size: 0.75rem; color: #555; text-align: center; margin-top: 16px; }
   </style>
 </head>
 <body>
 <div class="container">
   <div class="card">
-    <div class="logo">📱</div>
-    <h1>Where should we text you?</h1>
-    <p class="subtitle">Enter your phone number to receive your daily assignment digest and reply with questions.</p>
+    <div class="logo">💬</div>
+    <h1>Set up WhatsApp Notifications</h1>
+    <p class="subtitle">Get assignment reminders and daily digests on WhatsApp — valid for 72 hours.</p>
+
+    <div class="steps">
+      <div class="steps-title">One-time WhatsApp setup</div>
+      <ol>
+        <li>Save <span class="wa-num">+34 644 59 82 46</span> as a contact (CallMeBot)</li>
+        <li>Send it this exact message on WhatsApp:<br>
+            <span class="wa-msg">"I allow callmebot to send me messages"</span></li>
+        <li>You'll receive your API key back via WhatsApp — paste it below</li>
+      </ol>
+    </div>
 
     {% if error %}
       <div class="alert alert-error">{{ error }}</div>
     {% endif %}
 
     <form method="POST" action="/setup/phone">
-      <label for="phone">Phone Number</label>
+      <label for="phone">Your WhatsApp Number</label>
       <input type="tel" id="phone" name="phone" required autofocus
-             placeholder="+12025551234" value="{{ current or '' }}"/>
-      <p class="hint">Include country code — e.g. +1 for US numbers</p>
+             placeholder="+12025551234" value="{{ current_phone or '' }}"/>
+      <p class="hint">Include country code — e.g. +1 for US</p>
+
+      <label for="apikey">Your CallMeBot API Key</label>
+      <input type="text" id="apikey" name="apikey" required
+             placeholder="1234567" value="{{ current_apikey or '' }}"/>
+      <p class="hint">Sent to you by CallMeBot after step 2 above</p>
+
       <button type="submit" class="btn">Save &amp; Go to Dashboard</button>
     </form>
+    <p class="expires">Your registration stays active for 72 hours, then you'll need to re-enter.</p>
   </div>
 </div>
 </body>
@@ -904,18 +1204,27 @@ PHONE_HTML = """
 def setup_phone():
     if request.method == "GET":
         return render_template_string(PHONE_HTML, error=None,
-                                      current=flask_session.get("user_phone"))
+                                      current_phone=flask_session.get("user_phone"),
+                                      current_apikey=flask_session.get("callmebot_api_key"))
 
-    phone = request.form.get("phone", "").strip()
+    phone  = request.form.get("phone",  "").strip()
+    apikey = request.form.get("apikey", "").strip()
 
-    # Basic validation — must start with + and have at least 10 digits
-    import re
     digits = re.sub(r"\D", "", phone)
     if not phone.startswith("+") or len(digits) < 10:
-        return render_template_string(PHONE_HTML, error="Please enter a valid phone number with country code (e.g. +12025551234).",
-                                      current=phone)
+        return render_template_string(PHONE_HTML,
+            error="Please enter a valid phone number with country code (e.g. +12025551234).",
+            current_phone=phone, current_apikey=apikey)
 
-    flask_session["user_phone"] = phone
+    if not apikey:
+        return render_template_string(PHONE_HTML,
+            error="Please enter your CallMeBot API key.",
+            current_phone=phone, current_apikey=apikey)
+
+    flask_session["user_phone"]       = phone
+    flask_session["callmebot_api_key"] = apikey
+    save_registration(phone, apikey)   # persist for 72 hours server-side
+
     return redirect(url_for("dashboard"))
 
 
@@ -923,8 +1232,8 @@ def setup_phone():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    print("🚀 Starting Canvas Assistant...")
+    reminder_scheduler.start()
+    print("🚀 Starting Howard Canvas Assistant...")
     print(f"   Dashboard: http://localhost:{port}")
-    print(f"   SMS webhook: http://localhost:{port}/sms")
-    print("   (use ngrok to expose the webhook to Twilio)\n")
+    print(f"   WhatsApp notifications via CallMeBot\n")
     app.run(debug=False, host="0.0.0.0", port=port)

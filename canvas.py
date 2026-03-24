@@ -81,6 +81,7 @@ def get_upcoming_assignments(access_token: str = None, cookies: dict = None) -> 
 
             due_local = due_dt.astimezone(DISPLAY_TZ)
             assignments.append({
+                "id":          a.get("id"),
                 "course":      course_name,
                 "title":       a.get("name") or "Unnamed Assignment",
                 "due":         due_dt,

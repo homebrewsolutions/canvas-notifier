@@ -19,7 +19,12 @@ from ai import answer_question, summarize_assignments, generate_study_schedule
 from notifier import send_whatsapp
 from due_date_tracker import check_for_due_date_changes
 from storage import save_registration, get_registration, save_reminder, get_reminders_for_phone, delete_reminder
-import scheduler as reminder_scheduler
+try:
+    import scheduler as reminder_scheduler
+    SCHEDULER_AVAILABLE = True
+except ImportError:
+    reminder_scheduler = None
+    SCHEDULER_AVAILABLE = False
 try:
     from canvas_auth import start_login, submit_code, get_status
     BROWSER_AUTH = True
@@ -29,6 +34,10 @@ except ImportError:
 load_dotenv()
 
 app = Flask(__name__)
+
+# Start reminder scheduler (works for both direct run and gunicorn)
+if SCHEDULER_AVAILABLE:
+    reminder_scheduler.start()
 app.secret_key = os.getenv("FLASK_SECRET_KEY") or "howard-canvas-x9k2mzp-fallback-key"
 
 
@@ -1232,7 +1241,6 @@ def setup_phone():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    reminder_scheduler.start()
     print("🚀 Starting Howard Canvas Assistant...")
     print(f"   Dashboard: http://localhost:{port}")
     print(f"   WhatsApp notifications via CallMeBot\n")

@@ -1,12 +1,17 @@
 """
-scheduler.py — Background APScheduler that fires WhatsApp reminders.
+scheduler.py — Background thread that fires WhatsApp reminders every 5 minutes.
+Uses only stdlib threading — no apscheduler dependency.
 """
 
-from apscheduler.schedulers.background import BackgroundScheduler
+import threading
+import time
+import traceback
+
 from storage import get_pending_reminders, mark_reminder_sent
 from notifier import send_whatsapp
 
-_scheduler = BackgroundScheduler(daemon=True)
+_started = False
+_lock    = threading.Lock()
 
 
 def _check_reminders():
@@ -25,12 +30,26 @@ def _check_reminders():
             send_whatsapp(msg, to=r["phone"], api_key=r["api_key"])
             mark_reminder_sent(r["id"])
             print(f"[scheduler] sent reminder {r['id']} to {r['phone']}", flush=True)
-        except Exception as e:
-            print(f"[scheduler] failed reminder {r['id']}: {e}", flush=True)
+        except Exception:
+            print(f"[scheduler] failed reminder {r['id']}:", flush=True)
+            traceback.print_exc()
+
+
+def _loop():
+    while True:
+        try:
+            _check_reminders()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(300)  # 5 minutes
 
 
 def start():
-    if not _scheduler.running:
-        _scheduler.add_job(_check_reminders, "interval", minutes=5, id="reminders")
-        _scheduler.start()
+    global _started
+    with _lock:
+        if _started:
+            return
+        t = threading.Thread(target=_loop, daemon=True, name="reminder-scheduler")
+        t.start()
+        _started = True
         print("[scheduler] started — checking reminders every 5 min", flush=True)

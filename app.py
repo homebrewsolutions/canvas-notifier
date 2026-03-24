@@ -412,7 +412,7 @@ DASHBOARD_HTML = """
         else if (a.days_left <= 3) { urgencyClass='soon';     tag=`${a.days_left}d left`; tagClass='orange'; }
         else                       { urgencyClass='upcoming'; tag=`${a.days_left}d left`; tagClass='green'; }
         const testBadge = isTest(a.title)
-          ? `<span class="tag" style="background:#3d1a00;color:#ff9d4d;margin-right:6px">TEST/QUIZ</span>`
+          ? `<span class="tag" style="background:#0a1a3d;color:#7eb3ff;margin-right:6px">TEST/QUIZ</span>`
           : '';
         const rid = activeReminders[String(a.id)];
         const reminderBtn = rid

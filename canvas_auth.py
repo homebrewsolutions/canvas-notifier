@@ -131,7 +131,11 @@ def _login_thread(email: str, password: str):
 
         page.fill('input[name="passwd"]', password)
         page.click('#idSIButton9')
-        page.wait_for_load_state("load", timeout=15_000)
+        # networkidle waits for the SPA to finish rendering (not just HTML parse)
+        try:
+            page.wait_for_load_state("networkidle", timeout=20_000)
+        except PlaywrightTimeout:
+            page.wait_for_load_state("load", timeout=10_000)
 
         if _has_error(page):
             _init_q.put(_set(status="error", message=_error_text(page) or "Incorrect password."))
@@ -144,6 +148,12 @@ def _login_thread(email: str, password: str):
         # ── 2FA detection ─────────────────────────────────────────────────
         print(f"[2fa] detecting, url={page.url}", flush=True)
         print(f"[2fa] page title={page.title()}", flush=True)
+        # Dump visible text to help diagnose selector mismatches
+        try:
+            body_text = page.inner_text("body")[:600].replace("\n", " ")
+            print(f"[2fa] page text: {body_text}", flush=True)
+        except Exception:
+            pass
         twofa = _detect_2fa(page)
         print(f"[2fa] detected type={twofa}", flush=True)
 
@@ -340,7 +350,7 @@ def _detect_2fa(page) -> str | None:
     code_input_sel = 'input[name="otc"], input[name="code"], input[autocomplete="one-time-code"]'
 
     try:
-        page.wait_for_selector(f'{number_match_sel}, {code_input_sel}', timeout=10_000)
+        page.wait_for_selector(f'{number_match_sel}, {code_input_sel}', timeout=20_000)
     except PlaywrightTimeout:
         print("[2fa] timed out waiting for 2fa elements", flush=True)
 
